@@ -1,110 +1,123 @@
-# -*- coding: utf-8 -*-
 """
-cron: 20 8 * * *
-new Env('海底捞会员签到');
-"""
+海底捞签到
 
-import random
+打开微信海底捞小程序登录后随便抓-然后搜索_haidilao_app_token(一般在请求头里)把里面的TOKEN_APP开头的填到变量hdlck里面即可
+
+支持多用户运行
+
+多用户用&或者@隔开
+例如
+账号1：TOKEN_APP...123
+账号2： TOKEN_APP...000
+则变量为TOKEN_APP...123&TOKEN_APP...000
+export hdlck=""
+
+cron: 0 7,12 * * *
+const $ = new Env("海底捞签到");
+"""
+import requests
+import re
+import os
 import time
 
-import requests
+# ========== 替代原来的混淆代码 ==========
+all_print_list = []
 
-from notify_mtr import send
-from utils import get_data
+def myprint(msg):
+    msg = str(msg)
+    print(msg)
+    all_print_list.append(msg)
+# =======================================
 
-API_BASE = "https://superapp-public.kiwa-tech.com"
+# 分割变量
+if 'hdlck' in os.environ:
+    hdlck = re.split("@|&", os.environ.get("hdlck"))
+    print(f'查找到{len(hdlck)}个账号')
+else:
+    hdlck = []
+    print('无hdlck变量')
 
-UA_POOL = [
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 15_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile MicroMessenger NetType/4G Language/zh_CN",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile MicroMessenger NetType/WIFI Language/zh_CN",
-    "Mozilla/5.0 (Linux; Android 12; SM-G998B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.5304.105 Mobile Safari/537.36 MicroMessenger NetType/4G Language/zh_CN",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 14_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile MicroMessenger NetType/5G Language/zh_CN",
-]
-
-
-def api_post(path, json_data=None, token=None, ua=None):
-    url = f"{API_BASE}{path}"
-    headers = {
-        "Host": "superapp-public.kiwa-tech.com",
-        "appId": "15",
-        "content-type": "application/json",
-        "Accept-Encoding": "gzip,compress,br,deflate",
-        "User-Agent": ua,
-        "Referer": "https://servicewechat.com/wx1ddeb67115f30d1a/14/page-frame.html",
-    }
-    if token:
-        headers["_HAIDILAO_APP_TOKEN"] = token
-        headers["ReqType"] = "APPH5"
-        headers["Referer"] = f"{API_BASE}app-sign-in/?SignInToken={token}&source=MiniApp"
-
+# 发送通知消息
+def send_notification_message(title):
     try:
-        resp = requests.post(url, headers=headers, json=json_data, timeout=15)
-        return resp.json()
+        from sendNotify import send
+        send(title, ''.join(all_print_list))
     except Exception as e:
-        return {"success": False, "msg": str(e)}
+        if e:
+            print('发送通知消息失败！')
 
+# 登录信息查询
+def denlu(ck):
+    headers = {
+        '_haidilao_app_token': ck,
+        'user-agent': 'Mozilla/5.0 (Linux; Android 14; 2201122C Build/UKQ1.230917.001; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/126.0.6478.188 Mobile Safari/537.36 XWEB/1260097 MMWEBSDK/20240501 MMWEBID/2247 MicroMessenger/8.0.50.2701(0x2800323C) WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64'
+    }
+    data = {"type": 1}
+    qd = requests.post(url='https://superapp-public.kiwa-tech.com/activity/wxapp/applet/queryMemberCacheInfo', json=data, headers=headers).json()
+    if qd['success'] == True:
+        myprint(f"账号：{qd['data']['customerName']} 登录成功")
+        return qd['success']
+    elif qd['success'] == False:
+        myprint(f"登录失败")
+        return qd['success']
 
-class Haidilao:
-    def checkin(self, openid, uid, ua):
-        login_res = api_post(
-            "login/thirdCommLogin",
-            {"openId": openid, "country": "CN", "uid": uid, "type": 1, "codeType": 1},
-            ua=ua
-        )
+# 签到
+def sign(ck):
+    headers = {
+        '_haidilao_app_token': ck,
+        'user-agent': 'Mozilla/5.0 (Linux; Android 14; 2201122C Build/UKQ1.230917.001; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/126.0.6478.188 Mobile Safari/537.36 XWEB/1260097 MMWEBSDK/20240501 MMWEBID/2247 MicroMessenger/8.0.50.2701(0x2800323C) WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64'
+    }
+    data = {"signinSource": "MiniApp"}
+    qd = requests.post(url='https://superapp-public.kiwa-tech.com/activity/wxapp/signin/signin', json=data, headers=headers).json()
+    if qd['success'] == True:
+        myprint(f"签到状态：{qd['data']['signinQueryDetailList'][0]['activityName']}-{qd['data']['signinQueryDetailList'][0]['dailyDate']}获得碎片：{qd['data']['signinQueryDetailList'][0]['fragment']}")
+    elif qd['success'] == False:
+        myprint(f"签到状态：{qd['msg']}")
 
-        if not login_res.get("success"):
-            msg = login_res.get("msg", "")
-            if any(k in msg for k in ["失效", "过期", "无效", "token", "登录"]):
-                return "❌ Cookie 失效，请重新抓取 openid/uid"
-            return f"❌ 登录失败: {msg}"
+# 积分查询
+def jfcx(ck):
+    headers = {
+        '_haidilao_app_token': ck,
+        'user-agent': 'Mozilla/5.0 (Linux; Android 14; 2201122C Build/UKQ1.230917.001; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/126.0.6478.188 Mobile Safari/537.36 XWEB/1260097 MMWEBSDK/20240501 MMWEBID/2247 MicroMessenger/8.0.50.2701(0x2800323C) WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64'
+    }
+    qd = requests.post(url='https://superapp-public.kiwa-tech.com/activity/wxapp/signin/queryFragment', headers=headers).json()
+    if qd['success'] == True:
+        myprint(f"目前碎片：{qd['data']['total']}\n本期碎片将于{qd['data']['expireDate']}过期")
+    elif qd['success'] == False:
+        myprint(f"碎片查询失败")
 
-        token = login_res["data"]["token"]
-        name = login_res["data"].get("name", "未知")
+def main():
+    z = 1
+    for ck in hdlck:
+        try:
+            myprint(f'登录第{z}个账号')
+            myprint('----------------------')
+            zt = denlu(ck)
+            if zt == True:
+                try:
+                    print('-------------')
+                    sign(ck)
+                except Exception as e:
+                    print('签到异常')
+                try:
+                    print('-------------')
+                    jfcx(ck)
+                except Exception as e:
+                    print('签到异常')
+            else:
+                print('登录异常')
+            
+            myprint('----------------------')
+            z = z + 1
+        except Exception as e:
+            print('未知错误')
 
-        sign_res = api_post(
-            "activity/wxapp/signin/signin",
-            {"signinSource": "MiniApp"},
-            token=token,
-            ua=ua
-        )
-
-        if "重复" in sign_res.get("msg", ""):
-            frag = self._query_fragment(token, ua)
-            return f"🔄 {name} 今日已签到 | 碎片: {frag}"
-
-        if not sign_res.get("success"):
-            return "❌ Cookie 失效，请重新抓取 openid/uid"
-
-        frag = self._query_fragment(token, ua)
-        return f"✅ {name} 签到成功 | 碎片: {frag}"
-
-    def _query_fragment(self, token, ua):
-        frag_res = api_post("activity/wxapp/signin/queryFragment", None, token=token, ua=ua)
-        if frag_res.get("success"):
-            return frag_res.get("data", {}).get("total", "?")
-        return "?"
-
-
-if __name__ == "__main__":
-    data = get_data()
-    items = data.get("HAIDILAO", [])
-
-    if not items:
-        print("[海底捞] 未配置账号，请设置 HAIDILAO 环境变量")
-        exit(0)
-
-    results = []
-    for i, item in enumerate(items, 1):
-        ua = UA_POOL[i % len(UA_POOL)]
-        print(f"[海底捞] ---- 账号 {i}/{len(items)} ----")
-        msg = Haidilao().checkin(
-            openid=str(item.get("openid")),
-            uid=str(item.get("uid")),
-            ua=ua
-        )
-        print(f"[海底捞] {msg}")
-        results.append(msg)
-        if i < len(items):
-            time.sleep(3)
-
-    send("海底捞会员签到", "\n".join(results))
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as e:
+        print('未知错误')
+    try:
+        send_notification_message(title='海底捞')  # 发送通知
+    except Exception as e:
+        print('小错误')
