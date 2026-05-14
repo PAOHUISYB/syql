@@ -39,7 +39,8 @@
  *   5. POST /close → 关闭 WCS 会话
  */
 
-const got = require('got');
+const axios = require('axios');
+const { sendNotify } = require('./sendNotify');
 
 // ============ 配置 ============
 const APPID = 'wx2804355dbf8d15c3';          // 茶百道饮品点单小程序 APPID
@@ -69,7 +70,6 @@ function getAccounts(envName) {
   return raw.split(/[#,]/).map(s => s.trim()).filter(Boolean);
 }
 
-// 延时
 const delay = ms => new Promise(r => setTimeout(r, ms));
 
 // ============ WCS 客户端 ============
@@ -79,14 +79,15 @@ async function wxCode(openid) {
   const auth = getEnv('wx_auth');
 
   log(`[WCS] 请求 code, openid=${openid}`);
-  const resp = await got.post(`${url}/wx/code`, {
+  const resp = await axios.post(`${url}/wx/code`, {
+    appid: APPID,
+    openid: openid,
+  }, {
     headers: { auth, 'Content-Type': 'application/json' },
-    json: { appid: APPID, openid },
-    timeout: { request: 90000 },
-    retry: { limit: 1 },
+    timeout: 90000,
   });
 
-  const data = JSON.parse(resp.body);
+  const data = resp.data;
   if (!data.status || !data.data?.code) {
     throw new Error(`WCS 获取 code 失败: ${JSON.stringify(data)}`);
   }
@@ -100,10 +101,12 @@ async function wxClose(openid) {
   const auth = getEnv('wx_auth');
 
   try {
-    await got.post(`${url}/close`, {
+    await axios.post(`${url}/close`, {
+      appid: APPID,
+      openid: openid,
+    }, {
       headers: { auth, 'Content-Type': 'application/json' },
-      json: { appid: APPID, openid },
-      timeout: { request: 30000 },
+      timeout: 30000,
     });
     log(`[WCS] 会话已关闭, openid=${openid}`);
   } catch (e) {
@@ -132,21 +135,22 @@ const COMMON_HEADERS = {
 
 /**
  * 用 code 换 CSESSION token
- * 调用 decrypt 接口，把 code 传过去换取会话 token
  */
 async function decryptCode(code) {
   log(`[业务] 用 code 换 CSESSION token...`);
-  const resp = await got.post(`${API_GATEWAY}/applet/v2/decrypt`, {
+  const resp = await axios.post(`${API_GATEWAY}/applet/v2/decrypt`, {
+    code: code,
+  }, {
     headers: {
       ...COMMON_HEADERS,
       'Host': 'apisix-gateway-pro.shuxinyc.com',
     },
-    json: { code },
-    timeout: { request: 30000 },
+    timeout: 30000,
   });
 
-  const data = JSON.parse(resp.body);
+  const data = resp.data;
   // 尝试从响应中提取 CSESSION
+  // 方式1: 从 Set-Cookie 响应头提取
   const setCookie = resp.headers['set-cookie'];
   let csession = '';
 
@@ -161,16 +165,16 @@ async function decryptCode(code) {
     }
   }
 
-  // 也可能从响应 body 中拿
+  // 方式2: 从响应 body 中提取
   if (!csession && data.data) {
     csession = data.data.csession || data.data.token || data.data.sessionKey || '';
   }
 
   if (!csession) {
-    // 检查返回的 data 是否就是 token
     if (data.code === 0 || data.code === '000') {
       log(`[业务] decrypt 成功但未找到 CSESSION，可能需要从 cookie 提取`);
       log(`[业务] decrypt 响应: ${JSON.stringify(data).substring(0, 500)}`);
+      log(`[业务] set-cookie: ${JSON.stringify(setCookie)}`);
     }
     throw new Error(`无法获取 CSESSION token，decrypt 响应: ${JSON.stringify(data).substring(0, 300)}`);
   }
@@ -184,24 +188,23 @@ async function decryptCode(code) {
  */
 async function querySignInDetail(csession) {
   log(`[业务] 查询签到活动详情...`);
-  const resp = await got.post(`${MARKETING_GATEWAY}/marketing/minip/activity/queryDetail`, {
+  const resp = await axios.post(`${MARKETING_GATEWAY}/marketing/minip/activity/queryDetail`, {
+    id: '',
+    businessId: DEFAULT_BUSINESS_ID,
+    activityType: 3,
+    month: '',
+    year: '',
+    shopId: -1,
+  }, {
     headers: {
       ...COMMON_HEADERS,
       'Host': 'md-h5-gateway.shuxinyc.com',
       'CSESSION': csession,
     },
-    json: {
-      id: '',
-      businessId: DEFAULT_BUSINESS_ID,
-      activityType: 3,
-      month: '',
-      year: '',
-      shopId: -1,
-    },
-    timeout: { request: 30000 },
+    timeout: 30000,
   });
 
-  const data = JSON.parse(resp.body);
+  const data = resp.data;
   if (data.code !== '000') {
     throw new Error(`查询签到活动失败: ${data.msg}`);
   }
@@ -213,15 +216,6 @@ async function querySignInDetail(csession) {
 
   log(`[业务] 当前活动: ${detail.name}`);
   log(`[业务] 活动时间: ${detail.startTime} ~ ${detail.endTime}`);
-
-  // 检查当前是否在活动时间内
-  const now = new Date();
-  const start = parseDateTime(detail.startTime);
-  const end = parseDateTime(detail.endTime);
-  if (now < start || now > end) {
-    log(`[业务] ⚠️ 当前不在活动时间范围内`);
-  }
-
   return detail;
 }
 
@@ -230,22 +224,21 @@ async function querySignInDetail(csession) {
  */
 async function doSignIn(csession, businessId) {
   log(`[业务] 执行签到...`);
-  const resp = await got.post(`${MARKETING_GATEWAY}/marketing/minip/activity/join/signIn`, {
+  const resp = await axios.post(`${MARKETING_GATEWAY}/marketing/minip/activity/join/signIn`, {
+    id: '',
+    businessId: businessId || DEFAULT_BUSINESS_ID,
+    activityJoinSource: 0,
+    shopId: -1,
+  }, {
     headers: {
       ...COMMON_HEADERS,
       'Host': 'md-h5-gateway.shuxinyc.com',
       'CSESSION': csession,
     },
-    json: {
-      id: '',
-      businessId: businessId || DEFAULT_BUSINESS_ID,
-      activityJoinSource: 0,
-      shopId: -1,
-    },
-    timeout: { request: 30000 },
+    timeout: 30000,
   });
 
-  const data = JSON.parse(resp.body);
+  const data = resp.data;
   if (data.code === '000') {
     log(`[业务] ✅ 签到成功！日期: ${data.data?.signDate}`);
     
@@ -262,8 +255,8 @@ async function doSignIn(csession, businessId) {
       }
     }
     return data;
-  } else if (data.code === '501040048') {
-    log(`[业务] ⚠️ 已签到过或操作频繁: ${data.msg}`);
+  } else if (data.code === '501040048' || data.code === '301040013') {
+    log(`[业务] ✅ 今日已签到过: ${data.msg}`);
     return data;
   } else {
     throw new Error(`签到失败: code=${data.code}, msg=${data.msg}`);
@@ -275,16 +268,15 @@ async function doSignIn(csession, businessId) {
  */
 async function queryAssets(csession) {
   try {
-    const resp = await got.post('https://chabaidao-gateway2.shuxinyc.com/member2c/applet/head/assets', {
+    const resp = await axios.post('https://chabaidao-gateway2.shuxinyc.com/member2c/applet/head/assets', {}, {
       headers: {
         ...COMMON_HEADERS,
         'Host': 'chabaidao-gateway2.shuxinyc.com',
         'CSESSION': csession,
       },
-      json: {},
-      timeout: { request: 30000 },
+      timeout: 30000,
     });
-    const data = JSON.parse(resp.body);
+    const data = resp.data;
     if (data.code === '000') {
       log(`[业务] 💰 熊猫币: ${data.data?.pointsVal}, 优惠券: ${data.data?.couponNum}张, 等级: ${data.data?.level}`);
       return data.data;
@@ -295,17 +287,12 @@ async function queryAssets(csession) {
   return null;
 }
 
-// 日期解析
-function parseDateTime(str) {
-  // 格式: 20260511000000
-  const s = str.replace(/(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})/, '$1-$2-$3 $4:$5:$6');
-  return new Date(s);
-}
-
 // ============ 主流程 ============
 
 async function runAccount(openid) {
   log(`\n========== 账号 ${openid} 开始 ==========`);
+
+  let accountMsg = `【账号 ${openid}】`;
 
   let code;
   try {
@@ -313,6 +300,8 @@ async function runAccount(openid) {
     code = await wxCode(openid);
   } catch (e) {
     log(`❌ WCS 获取 code 失败: ${e.message}`);
+    accountMsg += `\n❌ WCS 失败: ${e.message}`;
+    notifyMsg.push(accountMsg);
     return;
   }
 
@@ -322,27 +311,42 @@ async function runAccount(openid) {
     csession = await decryptCode(code);
   } catch (e) {
     log(`❌ 获取 CSESSION 失败: ${e.message}`);
+    accountMsg += `\n❌ 获取 token 失败: ${e.message}`;
     await wxClose(openid);
+    notifyMsg.push(accountMsg);
     return;
   }
 
   try {
     // Step 3: 查询签到活动
-    await querySignInDetail(csession);
+    const detail = await querySignInDetail(csession);
+    accountMsg += `\n活动: ${detail?.name || '未知'}`;
 
     // Step 4: 执行签到
-    await doSignIn(csession);
+    const result = await doSignIn(csession);
+    if (result.code === '000') {
+      accountMsg += `\n签到: ✅ 成功 (${result.data?.signDate})`;
+    } else if (result.code === '301040013') {
+      accountMsg += `\n签到: 今日已签到 ✓`;
+    } else {
+      accountMsg += `\n签到: ${result.msg}`;
+    }
 
     // Step 5: 查询积分
-    await queryAssets(csession);
+    const assets = await queryAssets(csession);
+    if (assets) {
+      accountMsg += `\n熊猫币: ${assets.pointsVal} | 优惠券: ${assets.couponNum}张 | ${assets.level}`;
+    }
 
   } catch (e) {
     log(`❌ 业务操作失败: ${e.message}`);
+    accountMsg += `\n❌ 失败: ${e.message}`;
   } finally {
     // Step 6: 关闭 WCS 会话
     await wxClose(openid);
   }
 
+  notifyMsg.push(accountMsg);
   log(`========== 账号 ${openid} 结束 ==========\n`);
 }
 
@@ -367,12 +371,23 @@ async function main() {
   for (const openid of accounts) {
     await runAccount(openid);
     if (accounts.length > 1) {
-      await delay(3000); // 多账号间隔3秒
+      await delay(3000);
     }
   }
 
   log('🧋 全部账号处理完毕');
+
+  // 发送通知汇总
+  if (notifyMsg.length > 0) {
+    const title = '🧋 茶百道签到';
+    const content = notifyMsg.join('\n\n');
+    log(`[通知] 发送通知...`);
+    await sendNotify(title, content);
+  }
 }
+
+// 通知消息收集
+const notifyMsg = [];
 
 main().catch(e => {
   console.error('脚本异常退出:', e);
