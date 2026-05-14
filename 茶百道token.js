@@ -32,7 +32,8 @@
  *   3. POST /member2c/applet/head/assets → 查询积分余额
  */
 
-const got = require('got');
+const axios = require('axios');
+const { sendNotify } = require('./sendNotify');
 
 // ============ 配置 ============
 const APPID = 'wx2804355dbf8d15c3';
@@ -94,20 +95,19 @@ function makeHeaders(csession, host) {
  */
 async function querySignInDetail(csession) {
   log(`[查询] 获取签到活动信息...`);
-  const resp = await got.post(`${MARKETING_GATEWAY}/marketing/minip/activity/queryDetail`, {
+  const resp = await axios.post(`${MARKETING_GATEWAY}/marketing/minip/activity/queryDetail`, {
+    id: '',
+    businessId: DEFAULT_BUSINESS_ID,
+    activityType: 3,
+    month: '',
+    year: '',
+    shopId: -1,
+  }, {
     headers: makeHeaders(csession, 'md-h5-gateway.shuxinyc.com'),
-    json: {
-      id: '',
-      businessId: DEFAULT_BUSINESS_ID,
-      activityType: 3,
-      month: '',
-      year: '',
-      shopId: -1,
-    },
-    timeout: { request: 30000 },
+    timeout: 30000,
   });
 
-  const data = JSON.parse(resp.body);
+  const data = resp.data;
   if (data.code !== '000') {
     if (data.code === '501040048') {
       throw new Error('TOKEN_EXPIRED: 请勿频繁操作（可能 token 过期）');
@@ -141,18 +141,17 @@ async function querySignInDetail(csession) {
  */
 async function doSignIn(csession, businessId) {
   log(`[签到] 执行签到...`);
-  const resp = await got.post(`${MARKETING_GATEWAY}/marketing/minip/activity/join/signIn`, {
+  const resp = await axios.post(`${MARKETING_GATEWAY}/marketing/minip/activity/join/signIn`, {
+    id: '',
+    businessId: businessId || DEFAULT_BUSINESS_ID,
+    activityJoinSource: 0,
+    shopId: -1,
+  }, {
     headers: makeHeaders(csession, 'md-h5-gateway.shuxinyc.com'),
-    json: {
-      id: '',
-      businessId: businessId || DEFAULT_BUSINESS_ID,
-      activityJoinSource: 0,
-      shopId: -1,
-    },
-    timeout: { request: 30000 },
+    timeout: 30000,
   });
 
-  const data = JSON.parse(resp.body);
+  const data = resp.data;
 
   if (data.code === '000') {
     log(`[签到] ✅ 签到成功！日期: ${data.data?.signDate}`);
@@ -172,9 +171,9 @@ async function doSignIn(csession, businessId) {
       }
     }
     return { success: true, data };
-  } else if (data.code === '501040048') {
-    log(`[签到] ⚠️ 已签到过或操作频繁: ${data.msg}`);
-    return { success: false, alreadySigned: true, data };
+  } else if (data.code === '501040048' || data.code === '301040013') {
+    log(`[签到] ✅ 今日已签到过: ${data.msg}`);
+    return { success: true, alreadySigned: true, data };
   } else {
     throw new Error(`签到失败: code=${data.code}, msg=${data.msg}`);
   }
@@ -186,16 +185,15 @@ async function doSignIn(csession, businessId) {
 async function queryPrizeRecord(csession, businessId) {
   try {
     log(`[查询] 获取签到奖励记录...`);
-    const resp = await got.post(`${MARKETING_GATEWAY}/marketing/minip/activity/member/prize/record`, {
+    const resp = await axios.post(`${MARKETING_GATEWAY}/marketing/minip/activity/member/prize/record`, {
+      activityId: '',
+      businessId: businessId || DEFAULT_BUSINESS_ID,
+      queryCurrentNew: true,
+    }, {
       headers: makeHeaders(csession, 'md-h5-gateway.shuxinyc.com'),
-      json: {
-        activityId: '',
-        businessId: businessId || DEFAULT_BUSINESS_ID,
-        queryCurrentNew: true,
-      },
-      timeout: { request: 30000 },
+      timeout: 30000,
     });
-    const data = JSON.parse(resp.body);
+    const data = resp.data;
     if (data.code === 200 || data.code === '000') {
       const name = data.data?.name || '';
       const gifts = data.data?.receiveGiftList || [];
@@ -220,12 +218,11 @@ async function queryPrizeRecord(csession, businessId) {
  */
 async function queryAssets(csession) {
   try {
-    const resp = await got.post(`${MEMBER_GATEWAY}/member2c/applet/head/assets`, {
+    const resp = await axios.post(`${MEMBER_GATEWAY}/member2c/applet/head/assets`, {}, {
       headers: makeHeaders(csession, 'chabaidao-gateway2.shuxinyc.com'),
-      json: {},
-      timeout: { request: 30000 },
+      timeout: 30000,
     });
-    const data = JSON.parse(resp.body);
+    const data = resp.data;
     if (data.code === '000') {
       log(`[查询] 💰 熊猫币: ${data.data?.pointsVal}, 优惠券: ${data.data?.couponNum}张, 等级: ${data.data?.level}`);
       return data.data;
@@ -242,31 +239,47 @@ async function runAccount(token, index) {
   const tokenPreview = token.substring(0, 20) + '...';
   log(`\n========== 账号 ${index + 1} (${tokenPreview}) 开始 ==========`);
 
+  let accountMsg = `【账号${index + 1}】`;
+
   try {
     // Step 1: 查询签到活动
     const { detail, alreadySigned } = await querySignInDetail(token);
+    accountMsg += `\n活动: ${detail?.name || '未知'}`;
 
     // Step 2: 执行签到
     if (alreadySigned) {
       log(`今日已签到，跳过`);
+      accountMsg += `\n签到: 今日已签到 ✓`;
     } else {
-      await doSignIn(token, detail?.groupId ? undefined : DEFAULT_BUSINESS_ID);
+      const result = await doSignIn(token, detail?.groupId ? undefined : DEFAULT_BUSINESS_ID);
+      if (result.success || result.alreadySigned) {
+        accountMsg += `\n签到: ✅ 成功`;
+        if (result.data?.data?.signDate) {
+          accountMsg += ` (${result.data.data.signDate})`;
+        }
+      }
     }
 
     // Step 3: 查询奖励记录
     await queryPrizeRecord(token);
 
     // Step 4: 查询积分
-    await queryAssets(token);
+    const assets = await queryAssets(token);
+    if (assets) {
+      accountMsg += `\n熊猫币: ${assets.pointsVal} | 优惠券: ${assets.couponNum}张 | ${assets.level}`;
+    }
 
   } catch (e) {
     if (e.message.includes('TOKEN_EXPIRED') || e.message.includes('401') || e.message.includes('unauthorized')) {
       log(`❌ Token 已过期！请重新抓包获取 CSESSION，更新 CBD_TOKEN 环境变量`);
+      accountMsg += `\n❌ Token 已过期，需重新抓取`;
     } else {
       log(`❌ 操作失败: ${e.message}`);
+      accountMsg += `\n❌ 失败: ${e.message}`;
     }
   }
 
+  notifyMsg.push(accountMsg);
   log(`========== 账号 ${index + 1} 结束 ==========\n`);
 }
 
@@ -278,7 +291,7 @@ async function main() {
   if (tokens.length === 0) {
     console.error('❌ 缺少环境变量: CBD_TOKEN（茶百道 CSESSION token）');
     console.error('   获取方式：用抓包工具抓取茶百道小程序请求，从 Header 中复制 CSESSION 值');
-    console.error('   示例格式：1778734046|f8VbnmhQYwrMRMTH.xxx.6b8b9f894dc99def');
+    console.error('   示例格式：1778734046|f8VbnmhQYwrM...6b8b9f894dc99def');
     process.exit(1);
   }
 
@@ -287,12 +300,23 @@ async function main() {
   for (let i = 0; i < tokens.length; i++) {
     await runAccount(tokens[i], i);
     if (tokens.length > 1) {
-      await delay(2000); // 多账号间隔2秒
+      await delay(2000);
     }
   }
 
   log('🧋 全部账号处理完毕');
+
+  // 发送通知汇总
+  if (notifyMsg.length > 0) {
+    const title = '🧋 茶百道签到';
+    const content = notifyMsg.join('\n');
+    log(`[通知] 发送通知...`);
+    await sendNotify(title, content);
+  }
 }
+
+// 通知消息收集
+const notifyMsg = [];
 
 main().catch(e => {
   console.error('脚本异常退出:', e);
