@@ -267,7 +267,7 @@ PAGE_FRAME_VERSION = "180"
 # 是否领取每日赠金（daily gift）
 ENABLE_DAILY_GIFT = True
 # 是否领取笔笔省优惠券（gift）
-ENABLE_GIFT_REDEEM = True
+ENABLE_GIFT_REDEEM = False
 
 USER_AGENT_LIST = [
     "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -382,32 +382,62 @@ def get_balance(session: requests.Session, track_id: str, token: str, ua: str) -
     try:
         data = api_get(session, "/txbbs-mall/cashoutfree/getbalance",
                        headers=make_headers(track_id, session_token=token, ua=ua), ua=ua)
-        balance = data.get("balance", 0)
+        balance = int(data.get("balance", 0))
+        pending_balance = int(data.get("pending_balance", 0))
         free_count = data.get("free_coupon_count", 0)
         # 提现额度相关字段
-        withdrawable = data.get("withdrawable_balance", balance)  # 可提现金额
-        total_earned = data.get("total_earned", 0)  # 累计获得
-        total_withdrawn = data.get("total_withdrawn", 0)  # 累计提现
+        withdrawable = int(data.get("withdrawable_balance", balance))  # 可提现金额
+        total_earned = int(data.get("total_earned", 0))  # 累计获得
+        total_withdrawn = int(data.get("total_withdrawn", 0))  # 累计提现
+        total_deduct = float(data.get("total_deduct_face_value", 0))  # 累计抵扣面值
         return {
             "balance": balance,
+            "pending_balance": pending_balance,
             "free_count": free_count,
             "withdrawable": withdrawable,
             "total_earned": total_earned,
             "total_withdrawn": total_withdrawn,
+            "total_deduct": total_deduct,
             "raw": data,
         }
     except Exception as e:
         print(f"  ⚠️ 查余额失败：{e}", file=sys.stderr)
-        return {"balance": 0, "free_count": 0, "withdrawable": 0, "total_earned": 0, "total_withdrawn": 0, "raw": {}}
+        return {"balance": 0, "pending_balance": 0, "free_count": 0, "withdrawable": 0, "total_earned": 0, "total_withdrawn": 0, "total_deduct": 0, "raw": {}}
 
 
 def get_gifts_list(session: requests.Session, track_id: str, token: str, ua: str) -> list[dict]:
-    """获取笔笔省优惠券列表"""
+    """获取笔笔省优惠券列表
+    
+    API: /txbbs-delivery/deliveryblock/getgiftlist
+    返回结构: block_gift_list -> channel_gift_list -> gift_list
+    """
     try:
-        data = api_get(session, "/txbbs-mall/gift/listgifts?longitude=0&latitude=0",
+        data = api_get(session, "/txbbs-delivery/deliveryblock/getgiftlist?longitude=0&latitude=0",
                        headers=make_headers(track_id, session_token=token, ua=ua), ua=ua)
-        items = data.get("gift_info_list", [])
-        return [item for item in items if isinstance(item, dict)]
+        
+        # 解析嵌套结构：block_gift_list -> channel_gift_list -> gift_list
+        items = []
+        blocks = data.get("block_gift_list", [])
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            for channel in block.get("channel_gift_list", []):
+                if not isinstance(channel, dict):
+                    continue
+                for gift in channel.get("gift_list", []):
+                    if isinstance(gift, dict):
+                        items.append(gift)
+        
+        # 🔍 调试：打印所有券的完整信息
+        for idx, item in enumerate(items):
+            if isinstance(item, dict):
+                ci = item.get("coupon_info") or {}
+                print(f"  [DEBUG] 券#{idx}: gift_type={item.get('gift_type')} | status={item.get('gift_status')} | name={ci.get('name')} | face_value={ci.get('face_value')} | gift_id={item.get('gift_id')}", file=sys.stderr)
+                if item.get("gift_type") != "GT_COUPON":
+                    print(f"  [DEBUG]   ⚠️ 此券 gift_type 不是 GT_COUPON，会被跳过！", file=sys.stderr)
+                if item.get("gift_status") != "GS_AVAILABLE":
+                    print(f"  [DEBUG]   ⚠️ 此券 gift_status 不是 GS_AVAILABLE，会被跳过！", file=sys.stderr)
+        return items
     except Exception as e:
         print(f"  ⚠️ 查优惠券列表失败：{e}", file=sys.stderr)
         return []
@@ -518,16 +548,17 @@ def run_account(openid: str, cached_token: str | None) -> dict[str, Any]:
     balance = bal["balance"]
     free_count = bal["free_count"]
     withdrawable = bal["withdrawable"]
-    total_earned = bal["total_earned"]
-    total_withdrawn = bal["total_withdrawn"]
-    pending = bal.get("raw", {}).get("pending_balance", 0)
-    deduct = bal.get("raw", {}).get("total_deduct_face_value", "")
+    total_earned = bal.get("total_earned", 0)
+    total_withdrawn = bal.get("total_withdrawn", 0)
+    pending = bal.get("pending_balance", 0)
+    deduct = bal.get("total_deduct", 0)
 
     print(f"  💰 可提现额度：{_yuan(withdrawable)}", file=sys.stderr)
     print(f"  💰 账户余额：{_yuan(balance)}", file=sys.stderr)
     print(f"  ⏳ 待入账：{_yuan(pending)}", file=sys.stderr)
     print(f"  🎫 提现免费券：{free_count}张", file=sys.stderr)
-    print(f"  📊 累计获得：{_yuan(total_earned)} | 累计提现：{_yuan(total_withdrawn)}", file=sys.stderr)
+    # 累计获得/提现数据 API 不返回，隐藏显示
+    # print(f"  📊 累计获得：{_yuan(total_earned)} | 累计提现：{_yuan(total_withdrawn)}", file=sys.stderr)
     if deduct:
         print(f"  📊 累计抵扣面值：{deduct}元", file=sys.stderr)
 
@@ -569,22 +600,23 @@ def run_account(openid: str, cached_token: str | None) -> dict[str, Any]:
                 if ok:
                     _notify(f"✅ 每日赠金：{name} {amount_str}")
 
-    # ── 3. 领笔笔省优惠券 ──
+    # ── 3. 查笔笔省优惠券（只在开启领取时查询）──
     if ENABLE_GIFT_REDEEM:
         gifts = get_gifts_list(session, track_id, token, ua)
+        available_count = 0
         for gift in gifts:
             if gift.get("gift_type") != "GT_COUPON":
                 continue
             if gift.get("gift_status") != "GS_AVAILABLE":
                 continue
+            available_count += 1
             ci = gift.get("coupon_info") or {}
             name = ci.get("name", f"gift_id={gift.get('gift_id')}")
-            ok = redeem_gift(session, track_id, token, gift, ua)
-            if ok:
-                results["gift_redeemed"].append(name)
-                _notify(f"✅ 笔笔省优惠券：{name}")
-            else:
-                results["gift_skipped"].append(name)
+            results["gift_skipped"].append(name)  # 记录但不领取
+        if available_count > 0:
+            print(f"  📋 笔笔省优惠券：{available_count}张可领（已跳过领取）", file=sys.stderr)
+    else:
+        print("  📋 笔笔省领券：已关闭", file=sys.stderr)
 
     # ── 4. 再次查询余额（领券后刷新） ──
     bal_after = get_balance(session, track_id, token, ua)
@@ -688,7 +720,8 @@ def print_success(prefix: str, result: dict) -> None:
     print(f"{prefix} 💰 可提现额度：{result['withdrawable']}")
     print(f"{prefix} 💰 账户余额：{result['balance']}")
     print(f"{prefix} 🎫 提现免费券：{result['free_coupons']}张")
-    print(f"{prefix} 📊 累计获得：{result['total_earned']} | 累计提现：{result['total_withdrawn']}")
+    # 累计获得/提现数据 API 不返回，隐藏显示
+    # print(f"{prefix} 📊 累计获得：{result['total_earned']} | 累计提现：{result['total_withdrawn']}")
 
     dg = result.get("daily_gift_coupon")
     if dg:
