@@ -13,6 +13,7 @@ import sys
 import asyncio
 import json
 import random
+import re
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 
@@ -36,8 +37,8 @@ WX_SERVER_URL = os.getenv("wx_server_url", "http://127.0.0.1:8787")
 # WCS API Key(环境变量)
 WX_AUTH = os.getenv("wx_auth", "")
 
-# 多账号 openid（环境变量，用 # 或 , 分隔，单账号时可不配置）
-WXPAY = os.getenv("wxpay", "")
+# 多账号 openid（环境变量 qcwx，用 &, # 或 , 分隔，单账号时可不配置）
+QCWX = os.getenv("qcwx", "")
 
 # ===================== 其他配置 =====================
 # PushPlus 通知Token(环境变量,可选)
@@ -86,21 +87,11 @@ def build_direct_transport() -> AsyncHTTPTransport:
     return AsyncHTTPTransport()
 
 def parse_openids() -> List[str]:
-    """解析多账号 openid"""
-    if not WXPAY:
+    """解析多账号 openid，支持 &, #, , 分隔"""
+    if not QCWX:
         return []
 
-    # 支持 # 和 , 分隔
-    openids = []
-    for sep in ['#', ',']:
-        if sep in WXPAY:
-            openids = [x.strip() for x in WXPAY.split(sep) if x.strip()]
-            break
-
-    if not openids:
-        openids = [WXPAY.strip()]
-
-    return openids
+    return [x.strip() for x in re.split(r'[&#,]', QCWX) if x.strip()]
 
 # ===================== 品赞代理系统 =====================
 def parse_proxy_response(text: str) -> Optional[Dict[str, Any]]:
@@ -235,53 +226,74 @@ class QueChaoBot:
         self.ua = get_ua()
         self.client = None
 
+    @property
+    def account_label(self) -> str:
+        return f"{self.openid[:8]}..." if self.openid else "单账号"
+
     async def get_code(self) -> Optional[str]:
         """从 WCS 服务获取 code(POST + AUTH Header)"""
         request_url = f"{WX_SERVER_URL}/wx/code"
-        print(f"📡 [{self.openid[:8]}...] 请求 WCS 接口 | URL: {request_url}")
+        print(f"📡 [{self.account_label}] 请求 WCS 接口 | URL: {request_url}")
 
         headers = {
             "AUTH": WX_AUTH,
             "Content-Type": "application/json"
         }
 
-        # WCS POST body: 如果只有一个账号,openid 可省略,只传 appid
+        # 单账号模式只传 appid；多账号模式必须传 openid
         body = {"appid": APPID}
-        # 如果有多个账号,需要传 openid
-        # body = {"openid": self.openid, "appid": APPID}
+        if self.openid:
+            body["openid"] = self.openid
 
-        try:
-            async with httpx.AsyncClient(timeout=30.0, transport=build_direct_transport()) as client:
-                response = await client.post(request_url, headers=headers, json=body)
+        body_preview = {"appid": body.get("appid"), "openid": (self.openid[:8] + "...") if self.openid else "<omitted>"}
+        print(f"🧪 [{self.account_label}] 请求体预览 | {body_preview}")
 
-                print(f"📝 [{self.openid[:8]}...] 接口响应 | 状态码: {response.status_code}")
+        for attempt in range(1, 3):
+            try:
+                if attempt > 1:
+                    print(f"🔁 [{self.account_label}] 第 {attempt}/2 次获取 code 重试...")
+                async with httpx.AsyncClient(timeout=30.0, transport=build_direct_transport()) as client:
+                    response = await client.post(request_url, headers=headers, json=body)
 
-                if response.status_code != 200:
-                    print(f"❌ [{self.openid[:8]}...] 获取code失败 | HTTP错误: {response.status_code}")
-                    return None
+                    print(f"📝 [{self.account_label}] 接口响应 | 状态码: {response.status_code}")
 
-                res = response.json()
+                    if response.status_code != 200:
+                        resp_text = response.text[:300] if response.text else "<empty>"
+                        print(f"❌ [{self.account_label}] 获取code失败 | HTTP错误: {response.status_code} | 响应: {resp_text}")
+                        return None
 
-                # WCS 返回格式: {"status": true, "message": "success", "data": {"code": "..."}}
-                if not res.get("status") or not res.get("data") or not res.get("data").get("code"):
-                    print(f"❌ [{self.openid[:8]}...] 获取code失败 | 业务错误: {res.get('message', '未知错误')}")
-                    return None
+                    try:
+                        res = response.json()
+                    except json.JSONDecodeError:
+                        resp_text = response.text[:300] if response.text else "<empty>"
+                        print(f"❌ [{self.account_label}] 获取code失败 | 响应不是JSON格式 | 响应片段: {resp_text}")
+                        return None
 
-                code = res["data"]["code"]
-                code_preview = code[:8] + "..."
-                print(f"✅ [{self.openid[:8]}...] 获取code成功 | 预览: {code_preview}")
-                return code
+                    # WCS 返回格式: {"status": true, "message": "success", "data": {"code": "..."}}
+                    if not res.get("status") or not res.get("data") or not res.get("data").get("code"):
+                        print(f"❌ [{self.account_label}] 获取code失败 | 业务错误: {res.get('message', '未知错误')} | 完整响应: {json.dumps(res, ensure_ascii=False)}")
+                        return None
 
-        except json.JSONDecodeError:
-            print(f"❌ [{self.openid[:8]}...] 获取code失败 | 响应不是JSON格式")
-            return None
-        except Exception as e:
-            print(f"❌ [{self.openid[:8]}...] 获取code异常 | 原因: {str(e)}")
-            return None
+                    code = res["data"]["code"]
+                    code_preview = code[:8] + "..."
+                    print(f"✅ [{self.account_label}] 获取code成功 | 预览: {code_preview}")
+                    return code
+
+            except httpx.ReadTimeout as e:
+                print(f"❌ [{self.account_label}] 获取code超时 | 第 {attempt}/2 次 | 类型: {type(e).__name__} | repr: {repr(e)}")
+                if attempt < 2:
+                    await sleep(2000)
+                    continue
+                return None
+            except Exception as e:
+                print(f"❌ [{self.account_label}] 获取code异常 | 类型: {type(e).__name__} | repr: {repr(e)} | 原因: {str(e)}")
+                return None
+
+        return None
 
     async def get_token_by_code(self, code: str) -> Optional[str]:
         """通过code换取token"""
-        print(f"🔑 [{self.openid[:8]}...] 正在换取token...")
+        print(f"🔑 [{self.account_label}] 正在换取token...")
 
         headers = {
             "Host": "crm.nestlechinese.com",
@@ -323,15 +335,15 @@ class QueChaoBot:
                 res = response.json()
                 if res.get("access_token") and res.get("token_type", "Bearer").lower() == "bearer":
                     self.token = res["access_token"]
-                    print(f"✅ [{self.openid[:8]}...] 获取token成功 | 模式: {mode}")
+                    print(f"✅ [{self.account_label}] 获取token成功 | 模式: {mode}")
                     return self.token
                 else:
                     raise Exception(f"业务错误: {res.get('error', '未知错误')}")
         except Exception as e:
-            print(f"⚠️ [{self.openid[:8]}...] {mode}获取token失败 | 原因: {str(e)}")
+            print(f"⚠️ [{self.account_label}] {mode}获取token失败 | 原因: {str(e)}")
 
             if self.proxy_info and ENABLE_DIRECT_FALLBACK:
-                print(f"🌐 [{self.openid[:8]}...] 切换直连重试...")
+                print(f"🌐 [{self.account_label}] 切换直连重试...")
                 try:
                     async with httpx.AsyncClient(
                         headers=headers,
@@ -344,12 +356,12 @@ class QueChaoBot:
                         res = response.json()
                         if res.get("access_token"):
                             self.token = res["access_token"]
-                            print(f"✅ [{self.openid[:8]}...] 直连获取token成功")
+                            print(f"✅ [{self.account_label}] 直连获取token成功")
                             return self.token
                         else:
                             raise Exception(f"直连业务错误: {res.get('error', '未知错误')}")
                 except Exception as e2:
-                    print(f"❌ [{self.openid[:8]}...] 直连获取token失败 | 原因: {str(e2)}")
+                    print(f"❌ [{self.account_label}] 直连获取token失败 | 原因: {str(e2)}")
 
         return None
 
@@ -388,7 +400,7 @@ class QueChaoBot:
 
     def check_response(self, response_data: Dict[str, Any]) -> bool:
         if response_data.get("errcode") != 200:
-            print(f"❌ [{self.openid[:8]}...] 请求失败 | 原因: {response_data.get('errmsg', '未知错误')}")
+            print(f"❌ [{self.account_label}] 请求失败 | 原因: {response_data.get('errmsg', '未知错误')}")
             return False
         return True
 
@@ -404,7 +416,7 @@ class QueChaoBot:
                 return response_data.get("data")
             return None
         except Exception as e:
-            print(f"❌ [{self.openid[:8]}...] 获取积分失败 | 原因: {str(e)}")
+            print(f"❌ [{self.account_label}] 获取积分失败 | 原因: {str(e)}")
             return None
 
     async def daily_sign(self) -> Tuple[bool, str]:
@@ -417,7 +429,7 @@ class QueChaoBot:
 
             if response_data.get("errcode") == 201:
                 sign_msg = "今日已签到"
-                print(f"i️ [{self.openid[:8]}...] {sign_msg}")
+                print(f"i️ [{self.account_label}] {sign_msg}")
                 return True, sign_msg
 
             if self.check_response(response_data):
@@ -425,16 +437,16 @@ class QueChaoBot:
                 sign_day = data.get("sign_day", 0)
                 sign_points = data.get("sign_points", 0)
                 sign_msg = f"签到成功 | 连续{sign_day}天 | +{sign_points}积分"
-                print(f"✅ [{self.openid[:8]}...] {sign_msg}")
+                print(f"✅ [{self.account_label}] {sign_msg}")
                 return True, sign_msg
             else:
                 sign_msg = f"签到失败: {response_data.get('errmsg', '未知错误')}"
-                print(f"❌ [{self.openid[:8]}...] {sign_msg}")
+                print(f"❌ [{self.account_label}] {sign_msg}")
                 return False, sign_msg
 
         except Exception as e:
             sign_msg = f"签到异常: {str(e)}"
-            print(f"❌ [{self.openid[:8]}...] {sign_msg}")
+            print(f"❌ [{self.account_label}] {sign_msg}")
             return False, sign_msg
 
     async def get_task_list(self) -> List[Dict[str, Any]]:
@@ -452,11 +464,11 @@ class QueChaoBot:
                     if task.get("task_status") == 0
                     and task.get("task_guid") not in SKIP_TASK_GUIDS
                 ]
-                print(f"📋 [{self.openid[:8]}...] 待完成任务: {len(uncompleted_tasks)}个")
+                print(f"📋 [{self.account_label}] 待完成任务: {len(uncompleted_tasks)}个")
                 return uncompleted_tasks
             return []
         except Exception as e:
-            print(f"❌ [{self.openid[:8]}...] 获取任务列表失败 | 原因: {str(e)}")
+            print(f"❌ [{self.account_label}] 获取任务列表失败 | 原因: {str(e)}")
             return []
 
     async def complete_task(self, task_guid: str, task_desc: str) -> Tuple[bool, str]:
@@ -469,16 +481,16 @@ class QueChaoBot:
 
             if self.check_response(response_data):
                 msg = f"完成【{task_desc}】 | +2积分"
-                print(f"✅ [{self.openid[:8]}...] {msg}")
+                print(f"✅ [{self.account_label}] {msg}")
                 return True, msg
             else:
                 msg = f"【{task_desc}】失败: {response_data.get('errmsg', '未知错误')}"
-                print(f"❌ [{self.openid[:8]}...] {msg}")
+                print(f"❌ [{self.account_label}] {msg}")
                 return False, msg
 
         except Exception as e:
             msg = f"【{task_desc}】异常: {str(e)}"
-            print(f"❌ [{self.openid[:8]}...] {msg}")
+            print(f"❌ [{self.account_label}] {msg}")
             return False, msg
 
     async def run(self) -> Dict[str, Any]:
@@ -495,7 +507,7 @@ class QueChaoBot:
         }
 
         print(f"\n{'='*40}")
-        print(f"[{self.openid[:8]}...] 开始执行任务")
+        print(f"[{self.account_label}] 开始执行任务")
         print(f"{'='*40}")
 
         try:
@@ -521,7 +533,7 @@ class QueChaoBot:
                     return result
 
                 result["initial_score"] = initial_balance
-                print(f"💰 [{self.openid[:8]}...] 初始积分: {initial_balance}")
+                print(f"💰 [{self.account_label}] 初始积分: {initial_balance}")
 
                 # 每日签到
                 sign_success, sign_msg = await self.daily_sign()
@@ -545,14 +557,14 @@ class QueChaoBot:
                 if final_balance is not None:
                     result["final_score"] = final_balance
                     result["gained_score"] = final_balance - initial_balance
-                    print(f"📊 [{self.openid[:8]}...] 今日新增: {result['gained_score']}积分 | 当前: {final_balance}")
+                    print(f"📊 [{self.account_label}] 今日新增: {result['gained_score']}积分 | 当前: {final_balance}")
 
                 result["success"] = True
-                print(f"✅ [{self.openid[:8]}...] 任务执行完成")
+                print(f"✅ [{self.account_label}] 任务执行完成")
 
         except Exception as e:
             result["error"] = str(e)
-            print(f"❌ [{self.openid[:8]}...] 执行异常 | 原因: {str(e)}")
+            print(f"❌ [{self.account_label}] 执行异常 | 原因: {str(e)}")
 
         return result
 
@@ -568,11 +580,13 @@ async def main():
         sys.exit(1)
 
     openids = parse_openids()
-    # 单账号模式：如果没有配置 wxpay，使用默认空 openid
+    # 单账号模式：如果没有配置 qcwx，使用默认空 openid
     # WCS 只有一个绑定账号时，不需要传 openid，会自动用唯一账号
     if not openids:
-        print("ℹ️ 未配置 wxpay 环境变量 | 使用单账号模式(WCS 自动选择唯一账号)")
+        print("ℹ️ 未配置 qcwx 环境变量 | 使用单账号模式（WCS 自动选择唯一账号）")
         openids = [""]  # 空字符串表示不传 openid
+    else:
+        print(f"ℹ️ 检测到多账号 openid 配置 | 共 {len(openids)} 个 | 支持分隔符: &, #, ,")
 
     print(f"🔌 待执行账号: {len(openids)} 个")
     print(f"🌐 代理模式: {'单账号独立代理' if ENABLE_PER_ACCOUNT_PROXY else '全局共用代理'}\n")
@@ -585,7 +599,7 @@ async def main():
     for index, openid in enumerate(openids):
         proxy_info = global_proxy_info
         if ENABLE_PER_ACCOUNT_PROXY:
-            proxy_info = await get_valid_proxy(openid[:8])
+            proxy_info = await get_valid_proxy(openid[:8] if openid else "单账号")
             await sleep(PROXY_FETCH_INTERVAL)
 
         bot = QueChaoBot(openid, proxy_info)
