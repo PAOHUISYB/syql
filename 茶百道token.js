@@ -6,6 +6,7 @@
  * 环境变量：
  *   wx_server_url  - WCS 服务端地址（必填，如 http://192.168.1.4:8787）
  *   wx_auth        - WCS API Key（必填）
+ *   CBDWX         - 多账号 openid（可选，多账号用 & 或 # 分隔，单账号不填）
  *   CBD_TOKEN      - 手动 CSESSION token（可选，多账号用 # 分隔）
  *   CBD_APPID      - 茶百道小程序 appid（可选，默认 wx2804355dbf8d15c3）
  *
@@ -46,24 +47,6 @@ function clearCache(name) {
 function isTokenExpired(code, msg) {
   const s = String(code || '').toLowerCase() + (msg || '').toLowerCase();
   return ['10007', '501040048', '301040013', 'unauthorized', 'token_expired'].some(k => s.includes(k));
-}
-
-async function checkWcsHealth() {
-  try {
-    const resp = await axios.get(`${WX_SERVER_URL}/api/status`, {
-      headers: { 'auth': WX_AUTH },
-      timeout: 10000,
-    });
-    if (resp.data && resp.data.status) {
-      log(`[WCS] 服务状态正常`);
-      return true;
-    }
-    log(`[WCS] ⚠️ 服务状态异常: ${JSON.stringify(resp.data)}`);
-    return false;
-  } catch (e) {
-    log(`[WCS] ⚠️ 服务不可达: ${e.message}`);
-    return false;
-  }
 }
 
 async function getCodeFromWCS(appid, openid) {
@@ -124,78 +107,47 @@ async function getCodeFromWCS(appid, openid) {
   return null;
 }
 
-async function codeToSession(code, exchangeUrl, extraData, extraHeaders) {
-  if (!code) return null;
+async function getEncryptKeyFromWCS(appid) {
+  if (!WX_SERVER_URL || !WX_AUTH) return null;
+
   try {
-    const resp = await axios.post(exchangeUrl,
-      { code, ...(extraData || {}) },
+    log(`[WCS] POST ${WX_SERVER_URL}/wx/encrypt`);
+    const resp = await axios.post(`${WX_SERVER_URL}/wx/encrypt`,
+      { appid },
       {
-        headers: {
-          'Content-Type': 'application/json',
-          'User-Agent': 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
-          ...(extraHeaders || {}),
-        },
-        timeout: 20000,
+        headers: { 'auth': WX_AUTH, 'Content-Type': 'application/json' },
+        timeout: 90000,
       }
     );
-    return resp.data;
+
+    const data = resp.data;
+    if (data.status && data.data && data.data.encryptKey) {
+      log(`[WCS] ✅ encryptKey: ${data.data.encryptKey.substring(0, 20)}... iv: ${data.data.iv}`);
+      return data.data;
+    }
+    log(`[WCS] ⚠️ 获取 encryptKey 失败: ${JSON.stringify(data)}`);
+    return null;
   } catch (e) {
-    log(`[WCS] ⚠️ 换 token 失败: ${e.message}`);
+    log(`[WCS] ⚠️ encryptKey 请求失败: ${e.message}`);
     return null;
   }
 }
 
-/**
- * 获取 session（缓存 → WCS获取code → 换token → 缓存）
- */
-async function getSession(appid, accountName, exchangeUrl, extractFn, extraData, extraHeaders) {
-  const cache = loadCache();
-  if (cache[accountName] && cache[accountName].session) {
-    log(`[${accountName}] 使用缓存的 session`);
-    return cache[accountName].session;
-  }
-
-  // 健康检查（仅警告，不阻塞 — /api/status 可能误报但 /wx/code 实际可用）
-  const healthy = await checkWcsHealth();
-  if (!healthy) {
-    log(`[WCS] ⚠️ /api/status 返回异常，但继续尝试获取 code（可能只是 status 端点问题）`);
-  }
-
-  const code = await getCodeFromWCS(appid, '');
-  if (!code) return null;
-
-  const result = await codeToSession(code, exchangeUrl, extraData, extraHeaders);
-  if (!result) return null;
-
-  let session;
-  try { session = extractFn(result); } catch (e) {
-    log(`[${accountName}] 解析 session 异常: ${e.message}, 原始响应: ${JSON.stringify(result)}`);
-    return null;
-  }
-  if (!session) {
-    log(`[${accountName}] 未获取到有效 session, 原始响应: ${JSON.stringify(result)}`);
-    return null;
-  }
-
-  cache[accountName] = { session, updateTime: new Date().toISOString() };
-  saveCache(cache);
-  log(`[${accountName}] ✅ session 已缓存`);
-  return session;
-}
 
 // ════════════════════════════════════
 // 茶百道配置
 // ════════════════════════════════════
 
 const APPID = process.env.CBD_APPID || 'wx2804355dbf8d15c3';
-const PAGE_FRAME_VERSION = '1143';
+const PAGE_FRAME_VERSION = '1146';
 
 const APISIX_GATEWAY = 'https://apisix-gateway-pro.shuxinyc.com';
 const MARKETING_GATEWAY = 'https://md-h5-gateway.shuxinyc.com';
 const MEMBER_GATEWAY = 'https://chabaidao-gateway2.shuxinyc.com';
 
-const CODE_EXCHANGE_URL = `${APISIX_GATEWAY}/applet/v2/decrypt`;
-const DEFAULT_BUSINESS_ID = 'vbXC51kPVeIP';
+// 茶百道真正的登录接口（HAR index 121 证实：code 明文发送，无需加密）
+const LOGIN_URL = `${MEMBER_GATEWAY}/hll-auth-client/oauth2/login/get/info`;
+const DEFAULT_BUSINESS_ID = 'D1gIz6hDVa8U';
 
 // ════════════════════════════════════
 // 工具函数
@@ -210,7 +162,7 @@ function getEnv(name) { return process.env[name] || ''; }
 function getAccounts(envName) {
   const raw = getEnv(envName);
   if (!raw) return [];
-  return raw.split(/[#]/).map(s => s.trim()).filter(Boolean);
+  return raw.split(/[#&]/).map(s => s.trim()).filter(Boolean);
 }
 
 const delay = ms => new Promise(r => setTimeout(r, ms));
@@ -221,31 +173,86 @@ const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,
 // 茶百道 Session 获取
 // ════════════════════════════════════
 
-async function getChabaidaoSession(accountName) {
-  // code 换 session 时需要带小程序请求头（与业务接口一致），否则 apisix 网关拒绝
-  const exchangeHeaders = {
-    'Host': 'apisix-gateway-pro.shuxinyc.com',
+async function getChabaidaoSession(accountName, openid) {
+  // 1. 检查缓存
+  const cache = loadCache();
+  const cacheKey = openid ? `${accountName}_${openid.substring(0, 8)}` : accountName;
+  if (cache[cacheKey] && cache[cacheKey].session) {
+    log(`[${accountName}] 使用缓存的 session`);
+    return cache[cacheKey].session;
+  }
+
+  // 2. 获取 wx.login code
+  const code1 = await getCodeFromWCS(APPID, openid || '');
+  if (!code1) {
+    log(`[${accountName}] 获取 code 失败`);
+    return null;
+  }
+
+  const loginHeaders = (csession) => ({
+    'Host': 'chabaidao-gateway2.shuxinyc.com',
+    'Content-Type': 'application/json',
     'User-Agent': UA,
     'Referer': `https://servicewechat.com/${APPID}/${PAGE_FRAME_VERSION}/page-frame.html`,
-    'versionCode': '34580',
-    'versionName': '3.4.580',
+    'versionCode': '34592',
+    'versionName': '3.4.592',
     'xweb_xhr': '1',
     'Accept': '*/*',
     'Accept-Encoding': 'gzip, deflate, br',
     'Accept-Language': 'zh-CN,zh;q=0.9',
-  };
+    'CSESSION': csession || '',
+  });
 
-  return await getSession(APPID, accountName, CODE_EXCHANGE_URL,
-    (data) => {
-      if (data.code === 0 && data.data && data.data.session) {
-        return data.data.session;
-      }
-      log(`[${accountName}] 换 session 响应异常: code=${data.code}, msg=${data.msg}, data=${JSON.stringify(data.data)}`);
+  try {
+    // 3. 首次登录（pureSign=true，无 token）
+    log(`[${accountName}] 步骤1/2: 首次登录（pureSign=true）...`);
+    const resp1 = await axios.post(LOGIN_URL,
+      { token: '', groupId: '317964', memberSystemId: '21', code: code1, appId: APPID, pureSign: true },
+      { headers: loginHeaders(''), timeout: 20000 }
+    );
+    const data1 = resp1.data;
+    if (data1.code !== '000' || !data1.data || !data1.data.token) {
+      log(`[${accountName}] 首次登录失败: ${JSON.stringify(data1)}`);
       return null;
-    },
-    null,            // extraData
-    exchangeHeaders  // extraHeaders
-  );
+    }
+    const session1 = data1.data.token;
+    const shopId = data1.data.shopId || 0;
+    log(`[${accountName}] ✅ 首次登录成功: ${session1.substring(0, 30)}...`);
+
+    // 4. 获取新 code，二次登录（pureSign=false，带旧 token）
+    log(`[${accountName}] 步骤2/2: 二次登录刷新（pureSign=false）...`);
+    const code2 = await getCodeFromWCS(APPID, openid || '');
+    if (!code2) {
+      log(`[${accountName}] ⚠️ 获取第二次 code 失败，使用首次 session`);
+      cache[cacheKey] = { session: session1, shopId, updateTime: new Date().toISOString() };
+      saveCache(cache);
+      return session1;
+    }
+
+    const resp2 = await axios.post(LOGIN_URL,
+      { token: session1, groupId: '317964', memberSystemId: '21', code: code2, appId: APPID, pureSign: false },
+      { headers: loginHeaders(session1), timeout: 20000 }
+    );
+    const data2 = resp2.data;
+    if (data2.code === '000' && data2.data && data2.data.token) {
+      const session2 = data2.data.token;
+      const shopId2 = data2.data.shopId || shopId;
+      log(`[${accountName}] ✅ 二次登录成功（pureSign=false）: ${session2.substring(0, 30)}...`);
+      cache[cacheKey] = { session: session2, shopId: shopId2, updateTime: new Date().toISOString() };
+      saveCache(cache);
+      return session2;
+    }
+
+    // 二次登录失败，回退
+    log(`[${accountName}] ⚠️ 二次登录失败: ${JSON.stringify(data2)}，使用首次 session`);
+    cache[cacheKey] = { session: session1, shopId, updateTime: new Date().toISOString() };
+    saveCache(cache);
+    return session1;
+
+  } catch (e) {
+    log(`[${accountName}] 登录请求失败: ${e.message}, 响应: ${JSON.stringify(e.response?.data)}`);
+    return null;
+  }
 }
 
 // ════════════════════════════════════
@@ -264,8 +271,8 @@ function makeHeaders(csession, host) {
     'Sec-Fetch-Dest': 'empty',
     'Sec-Fetch-Mode': 'cors',
     'Sec-Fetch-Site': 'cross-site',
-    'versionCode': '34580',
-    'versionName': '3.4.580',
+    'versionCode': '34592',
+    'versionName': '3.4.592',
     'xweb_xhr': '1',
     'Host': host,
   };
@@ -275,11 +282,11 @@ function makeHeaders(csession, host) {
 // 业务 API
 // ════════════════════════════════════
 
-async function querySignInDetail(csession) {
+async function querySignInDetail(csession, shopId) {
   log(`[查询] 获取签到活动...`);
   const resp = await axios.post(
     `${MARKETING_GATEWAY}/marketing/minip/activity/queryDetail`,
-    { id: '', businessId: DEFAULT_BUSINESS_ID, activityType: 3, month: '', year: '', shopId: -1 },
+    { id: '', businessId: DEFAULT_BUSINESS_ID, activityType: 3, month: '', year: '', shopId: shopId || -1 },
     { headers: makeHeaders(csession, 'md-h5-gateway.shuxinyc.com'), timeout: 30000 }
   );
 
@@ -305,11 +312,11 @@ async function querySignInDetail(csession) {
   return { detail, alreadySigned: false };
 }
 
-async function doSignIn(csession, businessId) {
+async function doSignIn(csession, shopId, businessId) {
   log(`[签到] 执行签到...`);
   const resp = await axios.post(
     `${MARKETING_GATEWAY}/marketing/minip/activity/join/signIn`,
-    { id: '', businessId: businessId || DEFAULT_BUSINESS_ID, activityJoinSource: 0, shopId: -1 },
+    { id: '', businessId: businessId || DEFAULT_BUSINESS_ID, activityJoinSource: 0, shopId: shopId || -1 },
     { headers: makeHeaders(csession, 'md-h5-gateway.shuxinyc.com'), timeout: 30000 }
   );
 
@@ -329,8 +336,9 @@ async function doSignIn(csession, businessId) {
     return { success: true, data };
   }
 
-  if (isTokenExpired(data.code, data.msg)) throw new Error('TOKEN_EXPIRED');
+  // 301040013=今日已签到，不是 token 过期，先判断
   if (data.code === '301040013') { log(`[签到] 今日已签到过`); return { success: true, alreadySigned: true }; }
+  if (isTokenExpired(data.code, data.msg)) throw new Error('TOKEN_EXPIRED');
   throw new Error(`签到失败: code=${data.code}, msg=${data.msg}`);
 }
 
@@ -349,28 +357,66 @@ async function queryAssets(csession) {
   return null;
 }
 
+async function bindMemberInfo(csession) {
+  try {
+    // 先调用轻量接口预热 session（HAR 中 login 与 selectMemberInfo 之间隔了大量请求）
+    log(`[会员] 预热 session...`);
+    await axios.post(
+      `${MEMBER_GATEWAY}/coupon/applet/getMemberCouponTag`, {},
+      { headers: makeHeaders(csession, 'chabaidao-gateway2.shuxinyc.com'), timeout: 10000 }
+    );
+    await delay(500);
+
+    log(`[会员] 绑定会员身份...`);
+    const resp = await axios.post(
+      `${MEMBER_GATEWAY}/member2c/applet/v2/selectMemberInfo`,
+      { appID: APPID, sourceType: 30 },
+      { headers: makeHeaders(csession, 'chabaidao-gateway2.shuxinyc.com'), timeout: 15000 }
+    );
+    if (resp.data.code === '000') {
+      log(`[会员] ✅ 已绑定: cardNo=${resp.data.data?.cardNo || 'N/A'}, memberId=${resp.data.data?.memberId || 'N/A'}`);
+      return true;
+    }
+    log(`[会员] 绑定失败: ${JSON.stringify(resp.data)}`);
+    return false;
+  } catch (e) {
+    log(`[会员] 绑定请求失败: ${e.message}`);
+    return false;
+  }
+}
+
 // ════════════════════════════════════
 // 单账号流程
 // ════════════════════════════════════
 
-async function runAccount(accountName) {
-  log(`\n========== ${accountName} 开始 ==========`);
+async function runAccount(accountName, openid) {
+  const oid = openid || '';
+  const label = oid ? `${accountName}(${oid.substring(0, 8)}...)` : accountName;
+  log(`\n========== ${label} 开始 ==========`);
 
-  let msg = `【${accountName}】`;
+  let msg = `【${label}】`;
   let retry = 0;
+
+  const cacheKey = oid ? `${accountName}_${oid.substring(0, 8)}` : accountName;
 
   while (retry < 2) {
     try {
-      const csession = await getChabaidaoSession(accountName);
+      const csession = await getChabaidaoSession(accountName, oid);
       if (!csession) throw new Error('获取 session 失败');
 
-      const { detail, alreadySigned } = await querySignInDetail(csession);
+      // 读取 shopId（登录时已缓存）
+      const shopId = (loadCache()[cacheKey] || {}).shopId || -1;
+
+      // 绑定会员身份（两步登录后通常能成功）
+      await bindMemberInfo(csession);
+
+      const { detail, alreadySigned } = await querySignInDetail(csession, shopId);
       msg += `\n活动: ${detail?.name || '未知'}`;
 
       if (alreadySigned) {
         msg += `\n签到: 今日已签到`;
       } else {
-        const result = await doSignIn(csession);
+        const result = await doSignIn(csession, shopId);
         msg += `\n签到: 成功`;
         if (result.data?.data?.signDate) msg += ` (${result.data.data.signDate})`;
       }
@@ -378,25 +424,32 @@ async function runAccount(accountName) {
       const assets = await queryAssets(csession);
       if (assets) msg += `\n熊猫币: ${assets.pointsVal} | 优惠券: ${assets.couponNum}张 | ${assets.level}`;
 
-      log(`========== ${accountName} 结束 ==========\n`);
+      log(`========== ${label} 结束 ==========\n`);
       notifyMsg.push(msg);
       return;
 
     } catch (e) {
       if (e.message === 'TOKEN_EXPIRED') {
-        log(`[${accountName}] Token 过期，清除缓存并重试...`);
-        clearCache(accountName);
+        log(`[${label}] Token 过期，清除缓存并重试...`);
+        clearCache(cacheKey);
         retry++;
         continue;
       }
-      log(`[${accountName}] 失败: ${e.message}`);
+      // 会员id为空说明 session 未正确绑定，清缓存重试
+      if (e.message.includes('会员id不能为空')) {
+        log(`[${label}] Session 未绑定会员，清除缓存重试...`);
+        clearCache(cacheKey);
+        retry++;
+        continue;
+      }
+      log(`[${label}] 失败: ${e.message}`);
       msg += `\n失败: ${e.message}`;
       break;
     }
   }
 
   notifyMsg.push(msg);
-  log(`========== ${accountName} 结束 ==========\n`);
+  log(`========== ${label} 结束 ==========\n`);
 }
 
 // ════════════════════════════════════
@@ -416,8 +469,18 @@ async function main() {
   }
 
   if (useAutoMode) {
-    log(`自动模式 | WCS: ${WX_SERVER_URL}`);
-    await runAccount('账号1');
+    // 读取多账号 openid（环境变量 CBDWX，用 & 或 # 分隔）
+    const openids = getAccounts('CBDWX');
+    if (openids.length > 0) {
+      log(`自动模式 | WCS: ${WX_SERVER_URL} | ${openids.length} 个账号`);
+      for (let i = 0; i < openids.length; i++) {
+        await runAccount(`账号${i + 1}`, openids[i]);
+        if (i < openids.length - 1) await delay(2000);
+      }
+    } else {
+      log(`自动模式 | WCS: ${WX_SERVER_URL} | 单账号`);
+      await runAccount('账号1');
+    }
   } else {
     log(`手动模式 | ${tokens.length} 个账号`);
     for (let i = 0; i < tokens.length; i++) {
