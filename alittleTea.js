@@ -23,6 +23,19 @@ const WCS_URL = process.env.wx_server_url || '';
 const WCS_AUTH = process.env.wx_auth || '';
 const YDDWX = process.env.yddwx || '';
 
+const CACHE_FILE = require('path').join(__dirname, 'cache_alittle_tea.json');
+
+function loadCache() {
+  try {
+    if (require('fs').existsSync(CACHE_FILE)) return JSON.parse(require('fs').readFileSync(CACHE_FILE, 'utf-8'));
+  } catch (e) {}
+  return {};
+}
+
+function saveCache(cache) {
+  try { require('fs').writeFileSync(CACHE_FILE, JSON.stringify(cache, null, 2), 'utf-8'); } catch (e) {}
+}
+
 // ══════════════════════════════════════
 // 签名密钥 — 来自 3iXi 脚本，HAR 交叉验证通过
 // ══════════════════════════════════════
@@ -116,6 +129,14 @@ async function httpGet(url) {
   return resp.data;
 }
 
+async function validateToken(token, openid) {
+  try {
+    const url = buildSignedUrl('crm.activity.sign.in.config', { token, openid });
+    const resp = await httpGet(url);
+    return resp?.errCode === 10000;
+  } catch (e) { return false; }
+}
+
 // ══════════════════════════════════════
 // 单账号流程
 // ══════════════════════════════════════
@@ -124,42 +145,71 @@ async function runAccount(userKey, index) {
   const sn = `账号${index}(${label})`;
   log(`\n===== ${sn} =====`);
 
-  // 1. WCS 取码
-  const code = await getCodeFromWCS(userKey);
-  if (!code) return `[${label}] 取码失败`;
+  const cache = loadCache();
+  const cacheKey = userKey || 'default';
+  const cached = cache[cacheKey] || {};
 
-  // 2. 动态签名 → 获取 openid/unionid
-  const openidUrl = buildSignedUrl('crm.wechat.openid', { js_code: code });
-  const openidResp = await httpGet(openidUrl);
-  if (openidResp?.errCode !== 10000) {
-    log(`  crm.wechat.openid 失败: ${openidResp?.errMsg || JSON.stringify(openidResp)}`);
-    return `[${label}] openid 获取失败`;
+  // ─── Phase 1: 获取 token / openid（缓存优先，WCS 兜底） ───
+  let token, realOpenid, realUnionid, memberId;
+
+  if (cached.token && cached.realOpenid) {
+    const valid = await validateToken(cached.token, cached.realOpenid);
+    if (valid) {
+      log(`  ✅ 缓存token有效，跳过WCS取码`);
+      token = cached.token;
+      realOpenid = cached.realOpenid;
+      realUnionid = cached.realUnionid;
+      memberId = cached.memberId;
+    } else {
+      log(`  ⚠️ 缓存token已过期，重新获取`);
+      delete cache[cacheKey];
+      saveCache(cache);
+    }
   }
-  const realOpenid = openidResp.data.openid;
-  const realUnionid = openidResp.data.unionid;
-  log(`  openid ✅`);
 
-  // 3. 动态签名 → 登录换取 token
-  const loginUrl = buildSignedUrl('crm.member.wechat.user.login', {
-    openid: realOpenid,
-    unionid: realUnionid,
-  });
-  const loginResp = await httpGet(loginUrl);
-  const token = loginResp?.data?.token;
   if (!token) {
-    log(`  login 失败: ${loginResp?.errMsg || JSON.stringify(loginResp)}`);
-    return `[${label}] 登录失败`;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (attempt > 0) log(`  🔁 重新从WCS取code（第${attempt + 1}/2次）...`);
+
+      const code = await getCodeFromWCS(userKey);
+      if (!code) { if (attempt === 0) continue; return `[${label}] 取码失败`; }
+
+      const openidUrl = buildSignedUrl('crm.wechat.openid', { js_code: code });
+      const openidResp = await httpGet(openidUrl);
+      if (openidResp?.errCode !== 10000) {
+        if (attempt === 0) continue;
+        return `[${label}] openid 获取失败`;
+      }
+      realOpenid = openidResp.data.openid;
+      realUnionid = openidResp.data.unionid;
+      log(`  openid ✅`);
+
+      const loginUrl = buildSignedUrl('crm.member.wechat.user.login', {
+        openid: realOpenid,
+        unionid: realUnionid,
+      });
+      const loginResp = await httpGet(loginUrl);
+      token = loginResp?.data?.token;
+      if (!token) {
+        if (attempt === 0) continue;
+        return `[${label}] 登录失败`;
+      }
+      memberId = loginResp?.data?.member_id;
+      log(`  token ✅`);
+
+      await httpGet(buildSignedUrl('crm.member.member.login', {
+        member_id: String(memberId),
+        openid: realOpenid,
+      }));
+
+      cache[cacheKey] = { token, memberId, realOpenid, realUnionid, cached_at: new Date().toISOString() };
+      saveCache(cache);
+      break;
+    }
+    if (!token) return `[${label}] token获取失败`;
   }
-  const memberId = loginResp?.data?.member_id;
-  log(`  token ✅`);
 
-  // 4. 动态签名 → 会员登录
-  await httpGet(buildSignedUrl('crm.member.member.login', {
-    member_id: String(memberId),
-    openid: realOpenid,
-  }));
-
-  // 5. 动态签名 → 查签到状态
+  // ─── Phase 2: 签到业务 ───
   const configUrl = buildSignedUrl('crm.activity.sign.in.config', {
     token,
     openid: realOpenid,
