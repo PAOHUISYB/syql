@@ -35,6 +35,25 @@ SFWX = os.getenv("sfwx", "")
 # ===================== 通知配置 =====================
 PLUSPLUS_TOKEN = os.getenv("PLUSPLUS_TOKEN", "")
 
+# ===================== Token 缓存 =====================
+CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache_sanfu.json")
+
+def load_cache() -> dict:
+    try:
+        if os.path.exists(CACHE_FILE):
+            with open(CACHE_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+def save_cache(cache: dict) -> None:
+    try:
+        with open(CACHE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
 
 def parse_userkeys() -> List[str]:
     """解析多账号 userKey，支持 & # , 分隔"""
@@ -192,18 +211,52 @@ class SanfuSignin:
             print(f"  获取账号信息请求失败: {e}")
         return None
 
+    def validate_sid(self) -> bool:
+        """快速验证缓存 sid 是否有效"""
+        if not self.sid:
+            return False
+        url = f"{self.base_url}/ms-sanfu-wechat-customer/customer/index/equity?sid={self.sid}"
+        try:
+            response = self.client.get(url, headers=self.headers, timeout=15.0)
+            return response.status_code == 200 and response.json().get("code") == 200
+        except Exception:
+            return False
+
     def process_account(self) -> str:
         """处理单个账号的签到流程，返回结果消息"""
         print(f"\n开始处理账号: {self.label}")
 
-        # 1. WCS 取码
-        code = get_code_from_wcs(self.user_key)
-        if not code:
-            return f"[{self.label}] 取码失败"
+        # ─── Phase 1: 登录（缓存优先，WCS 兜底） ───
+        cache = load_cache()
+        cache_key = self.user_key or "default"
+        cached = cache.get(cache_key, {})
 
-        # 2. 登录
-        if not self.login(code):
-            return f"[{self.label}] 登录失败"
+        if cached.get("sid"):
+            self.sid = cached["sid"]
+            if self.validate_sid():
+                print(f"  ✅ 缓存sid有效，跳过WCS取码")
+            else:
+                print(f"  ⚠️ 缓存sid已过期，重新获取")
+                self.sid = None
+                cache.pop(cache_key, None)
+                save_cache(cache)
+
+        if not self.sid:
+            for attempt in range(2):
+                if attempt > 0:
+                    print(f"  🔁 登录失败，重新从WCS取code（第{attempt+1}/2次）...")
+                code = get_code_from_wcs(self.user_key)
+                if not code:
+                    if attempt == 0: continue
+                    return f"[{self.label}] 取码失败"
+                if self.login(code):
+                    break
+            if not self.sid:
+                return f"[{self.label}] 登录失败"
+            cache[cache_key] = {"sid": self.sid, "cached_at": datetime.now().isoformat()}
+            save_cache(cache)
+
+        # ─── Phase 2: 业务逻辑 ───"
 
         msgs = []
 
