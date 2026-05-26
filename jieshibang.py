@@ -5,6 +5,9 @@
 原始脚本作者：3iXi
 WCS 适配 + 多账号支持
 
+⚠️ 此脚本不支持 token 缓存：login 返回的 clientToken 无法用于后续 API
+   （get_client_info 返回 204 未登录），因此每次执行都从 WCS 取新鲜 code 签到。
+
 环境变量:
   jsbwx         — 多账号 WCS userKey，用 # & 或 , 分隔
   wx_server_url — WCS 取码服务地址
@@ -145,9 +148,13 @@ class JieshibangSignin:
                 client_token = data["data"]["data"].get("clientToken")
                 if client_token:
                     self.headers["authorization"] = f"Bearer {client_token}"
+                    print("  登录成功")
                     return client_token
+                print(f"  登录返回异常(无clientToken): {json.dumps(data, ensure_ascii=False)}")
             elif data.get("data", {}).get("code") == 1012:
                 return "CODE_EXPIRED"
+            else:
+                print(f"  登录失败: {json.dumps(data, ensure_ascii=False)}")
         except Exception as e:
             print(f"  登录请求失败: {e}")
         return None
@@ -173,8 +180,9 @@ class JieshibangSignin:
             data = response.json()
             if data.get("success") and data.get("data", {}).get("success"):
                 return data["data"]["data"]
+            print(f"  获取客户信息失败: {json.dumps(data, ensure_ascii=False)}")
         except Exception as e:
-            print(f"  获取客户信息失败: {e}")
+            print(f"  获取客户信息请求异常: {e}")
         return None
 
     def get_signin_activity_id(self, mob: str) -> Optional[str]:
@@ -455,27 +463,33 @@ class JieshibangSignin:
         return None
 
     def process_account(self) -> str:
-        """处理单个账号的签到和抽奖，返回结果消息"""
+        """处理单个账号的签到和抽奖（每次取新鲜 code，不支持 token 缓存）"""
         msgs = []
 
-        # 1. WCS 取码
-        code = get_code_from_wcs(self.user_key)
-        if not code:
-            return f"[{self.label}] 取码失败"
-
-        # 2. 登录
-        token = self.login(code)
-        if token == "CODE_EXPIRED":
-            print(f"  Code已过期，重新获取...")
-            self.clear_session()
+        # WCS 取 code → 登录（最多重试 2 次）
+        token = None
+        for attempt in range(2):
+            if attempt > 0:
+                print(f"  🔁 重试WCS取code（第{attempt+1}/2次）...")
+                self.clear_session()
             code = get_code_from_wcs(self.user_key)
-            if code:
-                token = self.login(code)
+            if not code:
+                if attempt == 0: continue
+                return f"[{self.label}] 取码失败"
+            token = self.login(code)
+            if token == "CODE_EXPIRED":
+                print(f"  Code已过期，重新获取...")
+                self.clear_session()
+                code = get_code_from_wcs(self.user_key)
+                if code:
+                    token = self.login(code)
+            if token and token != "CODE_EXPIRED":
+                break
         if not token or token == "CODE_EXPIRED":
             self.clear_session()
             return f"[{self.label}] 登录失败"
 
-        # 3. 客户信息
+        # ─── 业务逻辑 ───
         client_info = self.get_client_info()
         if not client_info:
             self.clear_session()
