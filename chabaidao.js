@@ -7,6 +7,7 @@
  *   wx_server_url  - WCS 服务端地址（必填，如 http://192.168.1.4:8787）
  *   wx_auth        - WCS API Key（必填）
  *   CBDWX         - 多账号 openid（可选，多账号用 & 或 # 分隔，单账号不填）
+ *   CBD_BUSINESS_ID - 签到活动 businessId（可选，活动换期时更新此变量即可，无需改脚本）
  *   CBD_TOKEN      - 手动 CSESSION token（可选，多账号用 # 分隔）
  *   CBD_APPID      - 茶百道小程序 appid（可选，默认 wx2804355dbf8d15c3）
  *
@@ -147,7 +148,38 @@ const MEMBER_GATEWAY = 'https://chabaidao-gateway2.shuxinyc.com';
 
 // 茶百道真正的登录接口（HAR index 121 证实：code 明文发送，无需加密）
 const LOGIN_URL = `${MEMBER_GATEWAY}/hll-auth-client/oauth2/login/get/info`;
-const DEFAULT_BUSINESS_ID = 'D1gIz6hDVa8U';
+// 活动 businessId 优先从环境变量读取，活动换期只需更新 CBD_BUSINESS_ID 变量，不用改脚本
+const DEFAULT_BUSINESS_ID = process.env.CBD_BUSINESS_ID || 'D1gIz6hDVa8U';
+
+// 已知常用 businessId 备选（活动结束后自动尝试下一个）
+const KNOWN_BUSINESS_IDS = [
+  process.env.CBD_BUSINESS_ID,
+  'D1gIz6hDVa8U',
+  'vbXC51kPVeIP',
+].filter(Boolean);
+
+// 尝试用空 businessId 自动发现当前活动（无签名，依赖 CSESSION）
+async function tryAutoDiscoverCurrentActivity(csession, shopId) {
+  try {
+    const resp = await axios.post(
+      `${MARKETING_GATEWAY}/marketing/minip/activity/queryDetail`,
+      { id: '', businessId: '', activityType: 3, month: '', year: '', shopId: shopId || -1 },
+      { headers: makeHeaders(csession, 'md-h5-gateway.shuxinyc.com'), timeout: 15000 }
+    );
+    const data = resp.data;
+    if (data.code === '000' && data.data?.signInDetail) {
+      const detail = data.data.signInDetail;
+      const today = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+      const start = (detail.startTime || '').slice(0, 8);
+      const end = (detail.endTime || '').slice(0, 8);
+      if (today >= start && today <= end) {
+        log(`[查询] 🔍 自动发现当前活动: ${detail.name} (${detail.startTime}~${detail.endTime})`);
+        return { detail, autoDiscovered: true };
+      }
+    }
+  } catch (e) { /* 自发现失败，回退到已知 businessId */ }
+  return null;
+}
 
 // ════════════════════════════════════
 // 工具函数
@@ -173,13 +205,32 @@ const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,
 // 茶百道 Session 获取
 // ════════════════════════════════════
 
+async function validateSession(csession) {
+  try {
+    const resp = await axios.post(
+      `${MEMBER_GATEWAY}/member2c/applet/head/assets`, {},
+      { headers: makeHeaders(csession, 'chabaidao-gateway2.shuxinyc.com'), timeout: 10000 }
+    );
+    return resp.data.code === '000';
+  } catch (e) {
+    return false;
+  }
+}
+
 async function getChabaidaoSession(accountName, openid) {
-  // 1. 检查缓存
+  // 1. 检查缓存并验证
   const cache = loadCache();
   const cacheKey = openid ? `${accountName}_${openid.substring(0, 8)}` : accountName;
   if (cache[cacheKey] && cache[cacheKey].session) {
-    log(`[${accountName}] 使用缓存的 session`);
-    return cache[cacheKey].session;
+    log(`[${accountName}] 检查缓存 session...`);
+    const valid = await validateSession(cache[cacheKey].session);
+    if (valid) {
+      log(`[${accountName}] ✅ 缓存session有效，跳过WCS取码`);
+      return cache[cacheKey].session;
+    }
+    log(`[${accountName}] ⚠️ 缓存session已过期，重新获取`);
+    delete cache[cacheKey];
+    saveCache(cache);
   }
 
   // 2. 获取 wx.login code
@@ -338,6 +389,10 @@ async function doSignIn(csession, shopId, businessId) {
 
   // 301040013=今日已签到，不是 token 过期，先判断
   if (data.code === '301040013') { log(`[签到] 今日已签到过`); return { success: true, alreadySigned: true }; }
+  // 301040011=活动已结束，无需重试
+  if (data.code === '301040011') { log(`[签到] 活动已结束`); return { success: false, activityEnded: true }; }
+  // 301040047=当前未开放领取（未到活动开放时间）
+  if (data.code === '301040047') { log(`[签到] 当前未到活动开放时间`); return { success: false, notYetOpen: true }; }
   if (isTokenExpired(data.code, data.msg)) throw new Error('TOKEN_EXPIRED');
   throw new Error(`签到失败: code=${data.code}, msg=${data.msg}`);
 }
@@ -416,9 +471,54 @@ async function runAccount(accountName, openid) {
       if (alreadySigned) {
         msg += `\n签到: 今日已签到`;
       } else {
-        const result = await doSignIn(csession, shopId);
-        msg += `\n签到: 成功`;
-        if (result.data?.data?.signDate) msg += ` (${result.data.data.signDate})`;
+        let signResult = await doSignIn(csession, shopId);
+
+        // 活动已结束 / 未开放 → 自动发现 → 备选 businessId
+        if (signResult.activityEnded || signResult.notYetOpen) {
+          let found = false;
+
+          // ① 先用空 businessId 自动发现当前活动
+          const discovered = await tryAutoDiscoverCurrentActivity(csession, shopId);
+          if (discovered) {
+            log(`[${label}] 🔍 自发现活动: ${discovered.detail.name}`);
+            const tryResult = await doSignIn(csession, shopId);
+            if (tryResult.success || tryResult.alreadySigned) {
+              signResult = tryResult;
+              found = true;
+            }
+          }
+
+          // ② 自发现失败 → 遍历已知 businessId
+          if (!found) {
+            for (const bid of KNOWN_BUSINESS_IDS) {
+              if (!bid || bid === DEFAULT_BUSINESS_ID) continue;
+              log(`[${label}] 尝试备用 businessId: ${bid}`);
+              const tryResult = await doSignIn(csession, shopId, bid);
+              if (tryResult.success || tryResult.alreadySigned) {
+                signResult = tryResult;
+                found = true;
+                log(`[${label}] ✅ 备用 businessId 签到成功: ${bid}`);
+                break;
+              }
+            }
+          }
+
+          if (!found) {
+            msg += signResult.activityEnded
+              ? `\n签到: 活动已结束（自发现+备选均失败，请更新 CBD_BUSINESS_ID）`
+              : `\n签到: 未到活动开放时间`;
+            log(`========== ${label} 结束 ==========\n`);
+            notifyMsg.push(msg);
+            return;
+          }
+        }
+
+        if (signResult.success || signResult.alreadySigned) {
+          msg += `\n签到: 成功`;
+          if (signResult.data?.data?.signDate) msg += ` (${signResult.data.data.signDate})`;
+        } else {
+          msg += `\n签到: ${signResult.activityEnded ? '活动已结束' : signResult.notYetOpen ? '未到开放时间' : '失败'}`;
+        }
       }
 
       const assets = await queryAssets(csession);
