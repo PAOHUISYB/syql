@@ -3,13 +3,15 @@
 """
 一点万象 每日签到
 =================
-H5 应用（非小程序），通过 deviceParams + token 直接签到。
-合并优化自 bash 版（签名逻辑更完整）和 Python 版（青龙兼容）。
+H5 应用，通过 deviceParams + token 直接签到。
+
+抓包: App 内点签到 → 筛选 app.mixcapp.com/mixc/gateway → POST 请求体
 
 环境变量:
   ydwx_deviceParams — 多账号 deviceParams，用 & 分隔
   ydwx_token        — 多账号 token，用 & 分隔（与 deviceParams 一一对应）
   ydwx_mallNo       — 商场编号，默认 20014
+  ydwx_imei         — 设备 IMEI，默认从 deviceParams 提取
   PLUSPLUS_TOKEN    — PushPlus 推送 token（可选）
 
 cron: 17 8 * * *
@@ -26,108 +28,109 @@ from datetime import datetime
 import requests
 
 # ════════════════════════════════════
-# 配置
+# 环境变量
 # ════════════════════════════════════
 DEVICE_PARAMS_LIST = os.getenv("ydwx_deviceParams", "")
 TOKEN_LIST = os.getenv("ydwx_token", "")
 MALL_NO = os.getenv("ydwx_mallNo", "20014")
+IMEI = os.getenv("ydwx_imei", "")  # 留空则自动从 deviceParams JSON 提取
 PLUSPLUS_TOKEN = os.getenv("PLUSPLUS_TOKEN", "")
 
+# ════════════════════════════════════
+# 固定配置
+# ════════════════════════════════════
 APP_ID = "68a91a5bac6a4f3e91bf4b42856785c6"
+APP_VERSION = "4.1.9"
+OS_VERSION = "26.4"
 SIGN_SECRET = "P@Gkbu0shTNHjhM!7F"
 SWIMLANE = "s1"
-API_VERSION = "1.0"
-ACTION = "mixc.app.memberSign.sign"
-PLATFORM = "h5"
-APP_VERSION = "4.0.12"
-OS_VERSION = "16.6.1"
-IMEI = "2333"
 URL = "https://app.mixcapp.com/mixc/gateway"
 
-UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 16_6_1 like Mac OS X) AppleWebKit/605.1.15 "
-      "(KHTML, like Gecko) Mobile/15E148 crland/4.4.0 grayscale/0 /MIXCAPP/4.0.12 AnalysysAgent/Hybrid")
+# 2026-05 HAR 实测 action 已从 mixc.app.memberSign.sign 变为 signDate
+ACTION = "mixc.app.memberSign.signDate"
 
-PARAMS_BASE = urllib.parse.quote(json.dumps({"mallNo": MALL_NO}, separators=(",", ":")))
+UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 "
+      "(KHTML, like Gecko) crland/4.4.0 grayscale/0 /MIXCAPP/4.1.9 AnalysysAgent/Hybrid")
 
 
 def log(msg: str) -> None:
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
 
 
-def build_sign(device_params: str, token: str, timestamp: str) -> str:
-    """按 key 排序后拼接 MD5，与 bash 版一致。签名时使用 URL 解码后的值。"""
+def extract_imei(device_params: str) -> str:
+    """尝试从 deviceParams JSON 中提取 deviceId 作为 imei。"""
+    try:
+        decoded = urllib.parse.unquote(device_params)
+        data = json.loads(decoded)
+        return data.get("deviceId", "")
+    except Exception:
+        return ""
+
+
+def sign_once(device_params: str, token: str, index: int) -> str:
+    """单账号签到。签名算法：所有字段按 key 排序，URL 解码后拼接 + secret，MD5。"""
+    label = f"账号{index}"
+    timestamp = str(int(time.time() * 1000))
     t = str(int(timestamp) + 25)
     date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    imei = IMEI or extract_imei(device_params)
+    params_raw = urllib.parse.quote(json.dumps({"mallNo": MALL_NO}, separators=(",", ":")))
+
+    # 签名字段（按 key 排序，URL 解码后参与签名）
     fields = {
         "X-Mixc-Swimlane": SWIMLANE,
         "action": ACTION,
-        "apiVersion": API_VERSION,
+        "apiVersion": "1.0",
         "appId": APP_ID,
         "appVersion": APP_VERSION,
         "date": date,
         "deviceParams": urllib.parse.unquote(device_params),
-        "imei": IMEI,
+        "imei": imei,
         "mallNo": MALL_NO,
         "osVersion": OS_VERSION,
-        "params": urllib.parse.unquote(PARAMS_BASE),
-        "platform": PLATFORM,
+        "params": urllib.parse.unquote(params_raw),
+        "platform": "h5",
         "t": t,
         "timestamp": timestamp,
         "token": token,
     }
 
     sign_src = "&".join(f"{k}={fields[k]}" for k in sorted(fields)) + f"&{SIGN_SECRET}"
-    return hashlib.md5(sign_src.encode("utf-8")).hexdigest(), t, date
+    sign = hashlib.md5(sign_src.encode("utf-8")).hexdigest()
 
-
-def build_body(device_params: str, token: str, timestamp: str) -> str:
-    """构建请求体，deviceParams/params 保持 URL 编码。"""
-    sign, t, date = build_sign(device_params, token, timestamp)
-
-    body_parts = [
-        ("mallNo", MALL_NO),
-        ("appId", APP_ID),
-        ("platform", PLATFORM),
-        ("imei", IMEI),
-        ("appVersion", APP_VERSION),
-        ("osVersion", OS_VERSION),
-        ("action", ACTION),
-        ("apiVersion", API_VERSION),
-        ("timestamp", timestamp),
-        ("deviceParams", device_params),
-        ("X-Mixc-Swimlane", SWIMLANE),
-        ("t", t),
-        ("date", urllib.parse.quote(date)),
-        ("token", token),
-        ("params", PARAMS_BASE),
-        ("sign", sign),
-    ]
-    return "&".join(f"{k}={v}" for k, v in body_parts)
-
-
-def build_referer(timestamp: str) -> str:
-    return (f"https://app.mixcapp.com/m/m-{MALL_NO}/signIn?"
-            f"appVersion={APP_VERSION}&mallNo={MALL_NO}&timestamp={timestamp}"
-            f"&showWebNavigation=true&hideNativeNavigation=true")
-
-
-def sign_once(device_params: str, token: str, index: int) -> str:
-    """单账号签到，返回结果摘要。"""
-    label = f"账号{index}"
-    timestamp = str(int(time.time() * 1000))
-
-    body = build_body(device_params, token, timestamp)
-    referer = build_referer(timestamp)
+    # 请求体（deviceParams/params 保持 URL 编码）
+    body = (
+        f"mallNo={MALL_NO}"
+        f"&appId={APP_ID}"
+        f"&platform=h5"
+        f"&imei={imei}"
+        f"&appVersion={APP_VERSION}"
+        f"&osVersion={OS_VERSION}"
+        f"&action={ACTION}"
+        f"&apiVersion=1.0"
+        f"&timestamp={timestamp}"
+        f"&deviceParams={device_params}"
+        f"&X-Mixc-Swimlane={SWIMLANE}"
+        f"&t={t}"
+        f"&date={urllib.parse.quote(date)}"
+        f"&token={token}"
+        f"&params={params_raw}"
+        f"&sign={sign}"
+    )
 
     headers = {
         "Host": "app.mixcapp.com",
         "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "zh-CN,zh-Hans;q=0.9",
+        "Content-Type": "application/x-www-form-urlencoded",
         "Origin": "https://app.mixcapp.com",
         "User-Agent": UA,
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Referer": referer,
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Dest": "empty",
+        "Accept-Language": "zh-CN,zh-Hans;q=0.9",
+        "Referer": (f"https://app.mixcapp.com/m/m-{MALL_NO}/signIn?"
+                    f"mallNo={MALL_NO}&appVersion={APP_VERSION}&timestamp={timestamp}"),
     }
 
     try:
@@ -135,7 +138,7 @@ def sign_once(device_params: str, token: str, index: int) -> str:
         data = resp.json()
     except requests.RequestException as e:
         log(f"  ❌ [{label}] 请求异常: {e}")
-        return f"[{label}] 请求异常: {e}"
+        return f"[{label}] 请求异常"
     except json.JSONDecodeError:
         log(f"  ❌ [{label}] 响应非JSON: {resp.text[:200]}")
         return f"[{label}] 响应非JSON"
@@ -154,7 +157,7 @@ def sign_once(device_params: str, token: str, index: int) -> str:
         return f"[{label}] 今日已签到"
 
     if "请求频繁" in msg:
-        log(f"  ⚠️ [{label}] 请求频繁，签名通过但需稍后重试")
+        log(f"  ⚠️ [{label}] 请求频繁")
         return f"[{label}] 请求频繁"
 
     log(f"  ❌ [{label}] 失败: {msg}")
@@ -189,10 +192,10 @@ def main() -> None:
         log("❌ 未配置 ydwx_deviceParams 或 ydwx_token")
         sys.exit(1)
 
-    if len(device_list) != len(token_list):
-        log(f"⚠️ deviceParams({len(device_list)}个) 与 token({len(token_list)}个) 数量不一致，按较短的执行")
-
     n = min(len(device_list), len(token_list))
+    if len(device_list) != len(token_list):
+        log(f"⚠️ deviceParams({len(device_list)}个) 与 token({len(token_list)}个) 数量不一致，执行前 {n} 个")
+
     log(f"共 {n} 个账号 | mallNo={MALL_NO}\n")
 
     results = []
