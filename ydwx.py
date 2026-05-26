@@ -53,6 +53,9 @@ UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.
       "(KHTML, like Gecko) crland/4.4.0 grayscale/0 /MIXCAPP/4.1.9 AnalysysAgent/Hybrid")
 
 
+DEBUG = os.getenv("ydwx_debug", "") == "1"
+
+
 def log(msg: str) -> None:
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
 
@@ -99,7 +102,14 @@ def sign_once(device_params: str, token: str, index: int) -> str:
     sign_src = "&".join(f"{k}={fields[k]}" for k in sorted(fields)) + f"&{SIGN_SECRET}"
     sign = hashlib.md5(sign_src.encode("utf-8")).hexdigest()
 
-    # 请求体（deviceParams/params 保持 URL 编码）
+    log(f"  🔍 [{label}] sign_src: {sign_src.replace(SIGN_SECRET, '***SECRET***')}")
+    log(f"  🔍 [{label}] sign: {sign}")
+    log(f"  🔍 [{label}] imei={imei} deviceParams_len={len(device_params)} token={token[:16]}...")
+
+    # 请求体（重新 URL 编码，确保兼容已解码/未解码的 env var）
+    body_device_params = urllib.parse.quote(fields["deviceParams"], safe="")
+    body_params = urllib.parse.quote(fields["params"], safe="")
+
     body = (
         f"mallNo={MALL_NO}"
         f"&appId={APP_ID}"
@@ -110,12 +120,12 @@ def sign_once(device_params: str, token: str, index: int) -> str:
         f"&action={ACTION}"
         f"&apiVersion=1.0"
         f"&timestamp={timestamp}"
-        f"&deviceParams={device_params}"
+        f"&deviceParams={body_device_params}"
         f"&X-Mixc-Swimlane={SWIMLANE}"
         f"&t={t}"
         f"&date={urllib.parse.quote(date)}"
         f"&token={token}"
-        f"&params={params_raw}"
+        f"&params={body_params}"
         f"&sign={sign}"
     )
 
