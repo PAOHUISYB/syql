@@ -40,6 +40,25 @@ WX_AUTH = os.getenv("wx_auth", "")
 # 多账号 openid（环境变量 qcwx，用 &, # 或 , 分隔，单账号时可不配置）
 QCWX = os.getenv("qcwx", "")
 
+# ===================== Token 缓存 =====================
+CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache_quechao.json")
+
+def load_cache() -> Dict[str, Any]:
+    try:
+        if os.path.exists(CACHE_FILE):
+            with open(CACHE_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+def save_cache(cache: Dict[str, Any]) -> None:
+    try:
+        with open(CACHE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
 # ===================== 其他配置 =====================
 # PushPlus 通知Token(环境变量,可选)
 PLUSPLUS_TOKEN = os.getenv("PLUSPLUS_TOKEN", "")
@@ -365,6 +384,27 @@ class QueChaoBot:
 
         return None
 
+    async def validate_token(self) -> bool:
+        """快速验证缓存 token 是否有效"""
+        if not self.token:
+            return False
+        try:
+            async with httpx.AsyncClient(
+                base_url=self.base_url,
+                headers=self._get_base_headers(),
+                transport=build_direct_transport(),
+                http2=True,
+                timeout=15.0,
+            ) as client:
+                response = await client.post(
+                    "/openapi/pointsservice/api/Points/getuserbalance",
+                    content="{}",
+                )
+                data = response.json()
+                return data.get("errcode") == 200
+        except Exception:
+            return False
+
     async def __aenter__(self):
         transport = build_proxy_transport(self.proxy_info) if self.proxy_info else build_direct_transport()
         self.client = httpx.AsyncClient(
@@ -513,19 +553,40 @@ class QueChaoBot:
         try:
             await sleep(random_int(2000, 5000))
 
-            # 1. 获取code
-            code = await self.get_code()
-            if not code:
-                result["error"] = "获取code失败"
-                return result
+            # ─── Phase 1: 获取 token（缓存优先，WCS 兜底） ───
+            cache = load_cache()
+            cache_key = self.openid or "default"
+            cached = cache.get(cache_key, {})
 
-            # 2. 获取token
-            token = await self.get_token_by_code(code)
-            if not token:
-                result["error"] = "获取token失败"
-                return result
+            if cached.get("token"):
+                self.token = cached["token"]
+                if await self.validate_token():
+                    print(f"✅ [{self.account_label}] 缓存token有效，跳过WCS取码")
+                else:
+                    print(f"⚠️ [{self.account_label}] 缓存token已过期，重新获取")
+                    self.token = None
+                    cache.pop(cache_key, None)
+                    save_cache(cache)
 
-            # 3. 执行业务
+            if not self.token:
+                for attempt in range(2):
+                    if attempt > 0:
+                        print(f"  🔁 token换取失败，重新从WCS取code（第{attempt+1}/2次）...")
+                    code = await self.get_code()
+                    if not code:
+                        if attempt == 0: continue
+                        result["error"] = "获取code失败"
+                        return result
+                    token = await self.get_token_by_code(code)
+                    if token: break
+                if not token:
+                    result["error"] = "获取token失败"
+                    return result
+
+                cache[cache_key] = {"token": self.token, "cached_at": datetime.now().isoformat()}
+                save_cache(cache)
+
+            # ─── Phase 2: 执行业务 ───
             async with self:
                 initial_balance = await self.get_user_balance()
                 if initial_balance is None:
