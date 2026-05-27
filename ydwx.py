@@ -46,8 +46,8 @@ SIGN_SECRET = "P@Gkbu0shTNHjhM!7F"
 SWIMLANE = "s1"
 URL = "https://app.mixcapp.com/mixc/gateway"
 
-# 2026-05 HAR 实测 action 已从 mixc.app.memberSign.sign 变为 signDate
-ACTION = "mixc.app.memberSign.signDate"
+# 2026-05 HAR 实测签到动作是 memberSign.sign
+ACTION = "mixc.app.memberSign.sign"
 
 UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 "
       "(KHTML, like Gecko) crland/4.4.0 grayscale/0 /MIXCAPP/4.1.9 AnalysysAgent/Hybrid")
@@ -156,11 +156,22 @@ def sign_once(device_params: str, token: str, index: int) -> str:
     msg = data.get("message", "")
     code = data.get("code")
 
-    if code == 0 or data.get("success") is True:
-        point = data.get("data", {}).get("point")
-        extra = f" +{point}积分" if point else ""
+    point = data.get("data", {}).get("point")
+    remain_step = data.get("data", {}).get("remainStep")
+
+    if code == 0 and point is not None:
+        extra = f" +{point}积分"
         log(f"  ✅ [{label}] 签到成功{extra}")
         return f"[{label}] 签到成功{extra}"
+
+    if code == 0 and msg in ("成功", None, "") and point is not None:
+        extra = f" +{point}积分"
+        log(f"  ✅ [{label}] 签到成功{extra}")
+        return f"[{label}] 签到成功{extra}"
+
+    if code == 0 and point is None and remain_step == 1:
+        log(f"  ❌ [{label}] 接口返回成功但未完成签到 | data={json.dumps(data, ensure_ascii=False)}")
+        return f"[{label}] 接口未完成签到"
 
     if "已签到" in msg or "不可重复签到" in msg:
         log(f"  ℹ️ [{label}] 今日已签到")
@@ -170,7 +181,7 @@ def sign_once(device_params: str, token: str, index: int) -> str:
         log(f"  ⚠️ [{label}] 请求频繁")
         return f"[{label}] 请求频繁"
 
-    log(f"  ❌ [{label}] 失败: {msg}")
+    log(f"  ❌ [{label}] 失败: {msg} | data={json.dumps(data, ensure_ascii=False)}")
     return f"[{label}] {msg}"
 
 
