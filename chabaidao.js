@@ -108,31 +108,8 @@ async function getCodeFromWCS(appid, openid) {
   return null;
 }
 
-async function getEncryptKeyFromWCS(appid) {
-  if (!WX_SERVER_URL || !WX_AUTH) return null;
-
-  try {
-    log(`[WCS] POST ${WX_SERVER_URL}/wx/encrypt`);
-    const resp = await axios.post(`${WX_SERVER_URL}/wx/encrypt`,
-      { appid },
-      {
-        headers: { 'auth': WX_AUTH, 'Content-Type': 'application/json' },
-        timeout: 90000,
-      }
-    );
-
-    const data = resp.data;
-    if (data.status && data.data && data.data.encryptKey) {
-      log(`[WCS] ✅ encryptKey: ${data.data.encryptKey.substring(0, 20)}... iv: ${data.data.iv}`);
-      return data.data;
-    }
-    log(`[WCS] ⚠️ 获取 encryptKey 失败: ${JSON.stringify(data)}`);
-    return null;
-  } catch (e) {
-    log(`[WCS] ⚠️ encryptKey 请求失败: ${e.message}`);
-    return null;
-  }
-}
+// 注意：getEncryptKeyFromWCS 已删除
+// /wx/operatedata 是付费接口（5积分/次），茶百道签到不需要，如需使用请先确认费用
 
 
 // ════════════════════════════════════
