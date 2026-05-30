@@ -38,6 +38,12 @@ import requests as plain_requests
 from curl_cffi import requests as cffi_requests
 from cryptography.fernet import Fernet
 
+# 青龙通知（内置 notify 模块，仅在青龙环境可用）
+try:
+    from notify import send as ql_notify_send
+except ImportError:
+    ql_notify_send = None
+
 # ════════════════════════════════════
 # 环境变量
 # ════════════════════════════════════
@@ -378,20 +384,33 @@ def sign_one(cookie_text: str, index: int) -> str:
 
 
 # ════════════════════════════════════
-# 推送
+# 推送（青龙 notify 优先，PushPlus 兜底）
 # ════════════════════════════════════
 def send_notify(content: str) -> None:
-    if not PLUSPLUS_TOKEN:
-        return
-    try:
-        plain_requests.post(
-            "https://www.pushplus.plus/send",
-            json={"token": PLUSPLUS_TOKEN, "title": "小黑盒签到", "content": content.replace("\n", "<br>"), "template": "txt"},
-            timeout=10,
-        )
-        log("✅ PushPlus 推送成功")
-    except Exception as e:
-        log(f"❌ PushPlus 推送失败: {e}")
+    title = "小黑盒签到"
+    # 方式1: 青龙内置 notify 模块
+    if ql_notify_send:
+        try:
+            ql_notify_send(title, content)
+            log("✅ 青龙通知推送成功")
+            return
+        except Exception as e:
+            log(f"⚠️ 青龙通知推送失败: {e}")
+
+    # 方式2: PushPlus
+    if PLUSPLUS_TOKEN:
+        try:
+            plain_requests.post(
+                "https://www.pushplus.plus/send",
+                json={"token": PLUSPLUS_TOKEN, "title": title, "content": content.replace("\n", "<br>"), "template": "txt"},
+                timeout=10,
+            )
+            log("✅ PushPlus 推送成功")
+            return
+        except Exception as e:
+            log(f"⚠️ PushPlus 推送失败: {e}")
+
+    log("ℹ️ 未配置推送通知")
 
 
 # ════════════════════════════════════
