@@ -145,6 +145,7 @@ def sign_once(device_params: str, token: str, index: int) -> str:
 
     try:
         resp = requests.post(URL, headers=headers, data=body, timeout=30)
+        raw_text = resp.text
         data = resp.json()
     except requests.RequestException as e:
         log(f"  ❌ [{label}] 请求异常: {e}")
@@ -153,11 +154,21 @@ def sign_once(device_params: str, token: str, index: int) -> str:
         log(f"  ❌ [{label}] 响应非JSON: {resp.text[:200]}")
         return f"[{label}] 响应非JSON"
 
-    msg = data.get("message", "")
+    # 非 200 或 data 为 None（API 返回 null）时打完整日志
+    if resp.status_code != 200 or data is None:
+        log(f"  🔍 [{label}] HTTP {resp.status_code} | body={raw_text[:500]}")
+
+    if data is None:
+        log(f"  ❌ [{label}] 接口返回 null")
+        return f"[{label}] 接口返回null"
+
+    msg = data.get("message", "") or ""
     code = data.get("code")
 
-    point = data.get("data", {}).get("point")
-    remain_step = data.get("data", {}).get("remainStep")
+    # 用 or {} 兜底：当 "data" key 存在但值为 null 时，.get("data", {}) 会返回 None
+    data_body = data.get("data") or {}
+    point = data_body.get("point")
+    remain_step = data_body.get("remainStep")
 
     if code == 0 and point is not None:
         extra = f" +{point}积分"
