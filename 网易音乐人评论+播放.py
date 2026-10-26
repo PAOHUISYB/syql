@@ -83,10 +83,12 @@ class NeteaseMusic:
         self.nickname = "未知账号"
 
     def _get_csrf_from_cookie(self, cookie):
+        # 取最后一个 __csrf（浏览器 Cookie 里可能出现重复字段，最后一个才是当前会话的值）
+        token = ""
         for item in cookie.split(';'):
             if item.strip().startswith('__csrf='):
-                return item.strip().split('=')[1]
-        return ""
+                token = item.strip().split('=', 1)[1]
+        return token
 
     def check_login_status(self):
         if not self.csrf_token:
@@ -102,7 +104,8 @@ class NeteaseMusic:
                 print(f"✅ 登入狀態正常！帳號：{self.nickname}")
                 return True
             return False
-        except:
+        except Exception as e:
+            print(f"⚠️ 检查登录状态异常: {e}")
             return False
 
     def get_track_detail(self, song_id):
@@ -120,7 +123,8 @@ class NeteaseMusic:
                     "artists": [artist.get("name", "") for artist in song.get("ar", [])]
                 }
             return None
-        except:
+        except Exception as e:
+            print(f"⚠️ 获取歌曲详情异常: {e}")
             return None
 
     def scrobble(self, song_id, source_id=0, time_sec=180):
@@ -164,7 +168,7 @@ class NeteaseMusic:
             else:
                 print(f"❌ [{i+1}/{count}] 打卡失敗：{message}")
             if i < count - 1:
-                time.sleep(random.uniform(1, 3))
+                time.sleep(random.uniform(3, 8))
         print(f"🏁 完成！成功 {success_count}/{count} 次。")
         return success_count, song_name
 
@@ -192,7 +196,8 @@ def save_cookies_to_file(session):
         with open(COOKIE_FILE, 'w') as f:
             json.dump(session.cookies.get_dict(), f)
         print(f"💾 Cookie 已保存到 {COOKIE_FILE}")
-    except: pass
+    except Exception as e:
+        print(f"⚠️ 保存 Cookie 失败: {e}")
 
 def load_cookies_from_file():
     if os.path.exists(COOKIE_FILE):
@@ -203,7 +208,8 @@ def load_cookies_from_file():
             session.cookies.update(cookies)
             SetCurrentSession(session)
             return get_cookie_string(session)
-        except: pass
+        except Exception as e:
+            print(f"⚠️ 读取本地 Cookie 失败: {e}")
     return None
 
 def smart_login(user, pwd, env_cookie):
@@ -252,8 +258,14 @@ if __name__ == "__main__":
             report.append(f"💬 评论任务：{'✅ 成功' if success else '❌ 失败 (' + msg + ')'}")
             
         # 2. 刷播放量任務
+        try:
+            count_int = int(SCROBBLE_COUNT)
+        except ValueError:
+            print(f"❌ SCROBBLE_COUNT 配置无效: {SCROBBLE_COUNT}，按 1 次执行")
+            count_int = 1
+        success_count = 0
         if SCROBBLE_SONG_ID:
-            success_count, song_name = nm.scrobble_song(SCROBBLE_SONG_ID, int(SCROBBLE_COUNT))
+            success_count, song_name = nm.scrobble_song(SCROBBLE_SONG_ID, count_int)
             report.append(f"🎵 刷播放量：{success_count}/{SCROBBLE_COUNT} 次")
             report.append(f"🎼 目标歌曲：{song_name}")
         
